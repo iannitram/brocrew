@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import AgentBookButton from './AgentBookButton.vue'
 import type { AgentIdentities } from '../../../shared/runtime-ipc'
 import type { WhatIsBeingDone } from '../../../shared/what-is-being-done'
+import type { WorkEdge } from '../../../shared/who-called-whom'
 import type { AgentStore } from '../lib/agent-store'
 import { AGENT_REMOVAL_MEANS } from '../../../shared/agent-roster'
 import { activityWords, STANDING_TONE } from '../lib/agent-state'
@@ -27,6 +28,7 @@ import { useAgentStore } from '../composables/useAgentStore'
 import { useMinuteClock } from '../composables/useMinuteClock'
 import AgentState from './AgentState.vue'
 import TeamForest from './TeamForest.vue'
+import TeamProfileGraph from './TeamProfileGraph.vue'
 import type { ForestRow, ForestView } from '../lib/the-forest'
 import { NEW_AGENT } from '../lib/where-agents-are-created'
 import { noProviderSavedSays } from '../lib/front-door-words'
@@ -48,6 +50,16 @@ import { noProviderSavedSays } from '../lib/front-door-words'
  * ([[a-number-can-survive-the-death-of-its-derivation]]).
  */
 const cast = useWhoCalledWhom()
+const workByHolder = computed(() => {
+  const holders = new Map<string, WorkEdge[]>()
+  for (const node of cast.forest.value?.nodes.rows ?? []) {
+    if (node.node !== 'a-task') continue
+    const pieces = holders.get(node.work.to)
+    if (pieces) pieces.push(node.work)
+    else holders.set(node.work.to, [node.work])
+  }
+  return holders
+})
 const props = withDefaults(
   defineProps<{
     agents: AgentIdentities | null
@@ -116,6 +128,7 @@ const store = props.store ?? useAgentStore()
 const TEAM_VIEWS = [
   { key: 'roster' as const, label: 'Directory' },
   { key: 'forest' as const, label: 'Who called whom' },
+  { key: 'profile-graph' as const, label: 'Profile graph' },
 ]
 type TeamView = (typeof TEAM_VIEWS)[number]['key']
 const showing = ref<TeamView>('roster')
@@ -143,8 +156,7 @@ function steer(event: KeyboardEvent, at: number): void {
   const key = keys[to]
   if (key === undefined) return
   showing.value = key
-  // ⚑ **Focus follows selection** — both panels are already in the document, so nothing is fetched
-  // and there is no reason to make a person press twice.
+  // Focus follows the selected tab. The profile graph reads on its first entry.
   strip.value?.querySelector<HTMLButtonElement>(`[data-cy="team-tab-${key}"]`)?.focus()
 }
 /**
@@ -312,6 +324,16 @@ function pressForest(row: ForestRow): void {
     </div>
 
     <div
+      v-show="showing === 'profile-graph'"
+      id="team-panel-profile-graph"
+      role="tabpanel"
+      aria-labelledby="team-tab-profile-graph"
+      data-cy="team-panel-profile-graph"
+    >
+      <TeamProfileGraph :active="showing === 'profile-graph'" @open="emit('open', $event)" />
+    </div>
+
+    <div
       v-show="showing === 'roster'"
       id="team-panel-roster"
       role="tabpanel"
@@ -444,9 +466,7 @@ function pressForest(row: ForestRow): void {
                     v-for="piece in workerSubtitles(
                       row.conversation,
                       row.namingPiece,
-                      cast.forest.value?.nodes.rows.flatMap((node) =>
-                        node.node === 'a-task' ? [node.work] : [],
-                      ) ?? [],
+                      workByHolder.get(row.conversation) ?? [],
                     )"
                     :key="piece.key"
                     class="team-worker-piece"
@@ -962,8 +982,12 @@ function pressForest(row: ForestRow): void {
 }
 .team-tabs {
   display: flex;
+  flex-wrap: wrap;
   border-bottom: var(--border-width) solid var(--line);
   gap: var(--space-4);
+}
+.team-header {
+  flex-wrap: wrap;
 }
 
 .team-tab {

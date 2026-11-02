@@ -6,6 +6,7 @@ import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 import { workSearchQuery } from '../../shared/work-search'
 import { filesLibraryRequest } from '../../shared/files-library'
+import { teamProfileGraphRequest } from '../../shared/team-profile-graph'
 import {
   MAX_BACKGROUND_ID,
   MAX_SETTINGS_BYTES,
@@ -879,6 +880,7 @@ export const runtimeCommandSchema = z.discriminatedUnion('kind', [
     query: workSearchQuery,
   }),
   z.strictObject({ kind: z.literal('filesLibrary'), request: filesLibraryRequest }),
+  z.strictObject({ kind: z.literal('teamProfileGraph'), request: teamProfileGraphRequest }),
   z.discriminatedUnion('scope', [
     z.strictObject({
       kind: z.literal('filesKept'),
@@ -1901,6 +1903,7 @@ const DURING_A_QUIT: Record<RuntimeCommandKind, QuitRuling> = {
   // lists is durable and read the same at the next launch.
   filesKept: 'refused',
   filesLibrary: 'refused',
+  teamProfileGraph: 'refused',
   searchWork: 'refused',
   readChildWork: 'refused',
   // 296. Both refused, and the send is the easier of the two to rule on: a quit is the moment this
@@ -2544,6 +2547,8 @@ export async function executeRuntimeCommand(
       return host.filesKept(command)
     case 'filesLibrary':
       return await host.filesLibraryForWindow(command.request, sink)
+    case 'teamProfileGraph':
+      return await host.teamProfileGraphForWindow(command.request, sink)
     case 'searchWork':
       return await host.searchWork(command.conversation, command.query)
     case 'readChildState':
@@ -3002,11 +3007,15 @@ export function registerRuntimeIpc(options: {
     options.pageReceipt === undefined
       ? options.ipc
       : takingThePagesReports(options.ipc, options.pageReceipt)
-  ipc.handle(RUNTIME_COMMAND_CHANNEL, (event, raw) =>
-    executeRuntimeCommand(options.host, options.sinkFor(event), raw).catch((error: unknown) => {
-      throw withoutItsClassName(error)
-    }),
-  )
+  ipc.handle(RUNTIME_COMMAND_CHANNEL, async (event, raw) => {
+    if (aCommandsKind(raw) === 'teamProfileGraph' && event.sender.isDestroyed())
+      throw new Error('Window closed.')
+    return executeRuntimeCommand(options.host, options.sinkFor(event), raw).catch(
+      (error: unknown) => {
+        throw withoutItsClassName(error)
+      },
+    )
+  })
 }
 
 /** The registrar, with the page's report answered by `receipt` before the command's listener. */
