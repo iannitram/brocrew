@@ -15,6 +15,9 @@ import startStorageWorker from './storage.worker?nodeWorker'
 import { StorageService } from './storage/service'
 import { clearHttpCache, httpCacheFolder } from './storage/cache'
 import { registerStorageIpc } from './storage/ipc'
+import { registerVoiceIpc } from './voice/ipc'
+import { VoiceService } from './voice/service'
+import { runVoiceHelper } from './voice/engine'
 import { backupsDir, databaseFile, recoveryDir, SIDECARS } from './recovery/layout'
 import { profileSkillAccess, SharedSkillDiscovery } from './skills/shared-discovery'
 import { convertSharedSkills } from './skills/shared-conversion'
@@ -88,6 +91,8 @@ import { startLimitsReader } from './db/start-limits-reader'
 import { startWindowReader } from './db/start-window-reader'
 import { startFilesLibrary } from './db/start-files-library'
 import { FilesLibraryWindows } from './db/files-library-windows'
+import { TeamProfileGraphWindows } from './db/team-profile-graph-windows'
+import { startTeamProfileGraph } from './db/start-team-profile-graph'
 import { startWorkSearch } from './db/start-work-search'
 import { startPastWorkSearch } from './db/start-past-work-search'
 import { createAppLifetime } from './app-lifetime'
@@ -451,6 +456,7 @@ let stopThemeIpc: (() => void) | undefined
 let stopProviderSetup: (() => Promise<void>) | undefined
 const appSetupWindows = new WeakSet<WebContents>()
 let stopStorageIpc: (() => void) | undefined
+let stopVoiceIpc: (() => void) | undefined
 const storageAppWindows = new WeakSet<WebContents>()
 let dockLabel: Promise<DockLabelHost> | undefined
 
@@ -843,6 +849,19 @@ async function createRuntimeHost(database: AppDatabase): Promise<RuntimeHost> {
         )
         .get()
       return JSON.stringify(stamp)
+    },
+    teamProfileGraphs: new TeamProfileGraphWindows((admission, failure) =>
+      startTeamProfileGraph(database.name, profileExecutionFile(userData), admission, failure),
+    ),
+    teamProfileGraphRevision: () => {
+      if (store.canReadFreshSnapshot?.() !== true) return null
+      return JSON.stringify(
+        database
+          .prepare(
+            'SELECT total_changes() AS writes, data_version AS version FROM pragma_data_version',
+          )
+          .get(),
+      )
     },
     themes: themes ?? undefined,
     mainThreadWork,
@@ -1379,6 +1398,21 @@ function registerIpc(runtimeHost: RuntimeHost, localZone: () => LocalZone | null
       !event.sender.isDestroyed() &&
       event.senderFrame === event.sender.mainFrame,
   })
+  stopVoiceIpc = registerVoiceIpc(
+    ipcMain,
+    new VoiceService((state) => {
+      if (process.platform !== 'darwin') throw new Error('Voice input requires macOS')
+      const binary = app.isPackaged
+        ? join(process.resourcesPath, '..', 'Helpers', 'brocrew-voice')
+        : join(app.getAppPath(), 'resources', 'voice', process.arch, 'brocrew-voice')
+      return runVoiceHelper(binary, state)
+    }),
+    (event) =>
+      storageAppWindows.has(event.sender) &&
+      !event.sender.isDestroyed() &&
+      event.senderFrame === event.sender.mainFrame,
+    (url) => shell.openExternal(url),
+  )
   installPluginUiRpc(pluginIpcMain)
   registerPluginSettings(
     ipcMain,
@@ -1621,6 +1655,7 @@ function registerIpc(runtimeHost: RuntimeHost, localZone: () => LocalZone | null
         libraryWindows.add(event.sender)
         const closeLibrary = () => {
           void runtimeHost.closeFilesLibraryWindow(sink.ownerId)
+          void runtimeHost.closeTeamProfileGraphWindow(sink.ownerId)
         }
         event.sender.on('render-process-gone', closeLibrary)
         event.sender.once('destroyed', closeLibrary)
@@ -1979,6 +2014,8 @@ function stopWhatTheStartStarted(): Promise<void> {
     stopThemeIpc = undefined
     stopStorageIpc?.()
     stopStorageIpc = undefined
+    stopVoiceIpc?.()
+    stopVoiceIpc = undefined
     void dockLabel?.then((label) => label.stop())
     await themes?.close().catch(() => undefined)
     const started = host
@@ -2639,6 +2676,8 @@ const lifetime = createAppLifetime({
     stopThemeIpc = undefined
     stopStorageIpc?.()
     stopStorageIpc = undefined
+    stopVoiceIpc?.()
+    stopVoiceIpc = undefined
     void dockLabel?.then((label) => label.stop())
     void themes?.close().catch(() => undefined)
   },

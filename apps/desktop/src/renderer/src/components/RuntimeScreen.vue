@@ -259,6 +259,7 @@ import { type WorkGivenOutReading } from '../lib/work-given-out'
 import { theWorkAPersonGave } from '../lib/working-together'
 import { filesReadFor } from '../lib/files-kept'
 import { createFilesLibrary, provideFilesLibrary } from '../composables/useFilesLibrary'
+import { createTeamProfileGraph, provideTeamProfileGraph } from '../composables/useTeamProfileGraph'
 import FilesLibraryPreview from './FilesLibraryPreview.vue'
 import { useWhoCalledWhom } from '../composables/useWhoCalledWhom'
 import { MAX_DIGEST_SPAN_MS } from '../../../shared/digest'
@@ -1406,6 +1407,11 @@ const filesLibrary = createFilesLibrary({
     activeId.value === null ? null : { id: activeId.value, name: conversationName(activeId.value) },
 })
 provideFilesLibrary(filesLibrary)
+const teamProfileGraph = createTeamProfileGraph({
+  read: (request) => window.api.runtime.teamProfileGraph(request),
+  workspace: () => info.value?.workspace.path ?? null,
+})
+provideTeamProfileGraph(teamProfileGraph)
 
 /**
  * What each provider can do, as its adapter declares it (039).
@@ -3343,7 +3349,6 @@ let stopProviderFacts: (() => void) | null = null
  * the states, and a message that kept a file reads the files again ({@link readTheFiles}, UI-002).
  */
 let stopHearingStates: (() => void) | null = null
-
 onMounted(() => {
   if (typeof window.api.runtime.onProvidersChanged === 'function')
     stopProviderFacts = window.api.runtime.onProvidersChanged((message) => {
@@ -3352,6 +3357,7 @@ onMounted(() => {
     })
   stopHearingStates = listenProviderStates(window.api.runtime, store, (message) => {
     rail.value?.hearStates(message)
+    teamProfileGraph.markStale()
     // ⚑ **UI-002 · a file kept anywhere is read again at once** — see {@link readTheFiles}.
     if (message.kept.length > 0) {
       filesLibrary.markStale()
@@ -3363,6 +3369,7 @@ onMounted(() => {
   void readTheFiles()
   stopListening = whenTheWorldMoves((listener) => window.api.runtime.onChanged(listener), {
     conversations: () => {
+      teamProfileGraph.markStale()
       filesLibrary.markStale()
       void rail.value?.refreshResumable().then(lookAgainIfItMoved)
       void library.value?.refreshResumable()
@@ -3393,6 +3400,7 @@ onMounted(() => {
     // conversations' ledgers, so the reader asks the question it already asks and gets the whole
     // answer — which is this channel's contract rather than an economy.
     work: () => {
+      teamProfileGraph.markStale()
       filesLibrary.markStale()
       void readTheCast()
       // ⚑ **D-016 · commit 7 · R2 — and the rail's list, for the work that names each
@@ -3418,6 +3426,7 @@ onMounted(() => {
     // and this one are the same function rather than two readers of one store.
     // ⚑ **UI-012 · and the model lists** — a last pick, a default or a hand-added model moved.
     agents: () => {
+      teamProfileGraph.markStale()
       filesLibrary.markStale()
       refreshAgents()
       void modelLists.reread()
