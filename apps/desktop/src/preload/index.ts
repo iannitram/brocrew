@@ -37,7 +37,7 @@ import {
   type WindowControl,
   type WindowControlEffect,
 } from '../shared/window-controls'
-import type { AppInfo } from '@brobot2/shared'
+import type { AppInfo, ProviderConnection } from '@brobot2/shared'
 import {
   UPDATES_CHANNELS,
   type UpdatesSettingsChange,
@@ -125,6 +125,7 @@ import {
   type CheckProviderAuthInput,
   type ProviderSignInResult,
   type ReprovisionOutcome,
+  type ProviderHomesReprovision,
   type CreateSessionInput,
   type ExportAsked,
   type ExportedSession,
@@ -556,6 +557,8 @@ const runtime: RuntimeBridge = Object.freeze({
     command({ kind: 'latestHistory', ...input }) as Promise<HistoryWindow>,
   capabilities: (): Promise<ProviderCapabilityMap> =>
     command({ kind: 'capabilities' }) as Promise<ProviderCapabilityMap>,
+  providerConnections: (): Promise<readonly ProviderConnection[]> =>
+    command({ kind: 'providerConnections' }) as Promise<readonly ProviderConnection[]>,
   // Which profiles exist (167) — the launcher's menu. Re-asked after a launch, because starting a
   // session in a name that was typed is what brings that profile into existence.
   profiles: (): Promise<string[]> => command({ kind: 'profiles' }) as Promise<string[]>,
@@ -820,6 +823,11 @@ const runtime: RuntimeBridge = Object.freeze({
 
   checkProviderAuth: (input: CheckProviderAuthInput): Promise<AuthState> =>
     command({ kind: 'checkProviderAuth', ...input }) as Promise<AuthState>,
+  reprovisionProviderHomes: (input: {
+    provider: Provider
+    statusOnly?: boolean
+  }): Promise<ProviderHomesReprovision> =>
+    command({ kind: 'reprovisionProviderHomes', ...input }) as Promise<ProviderHomesReprovision>,
   reprovisionProviderAuth: (input: ProviderProfileInput): Promise<ReprovisionOutcome> =>
     command({ kind: 'reprovisionProviderAuth', ...input }) as Promise<ReprovisionOutcome>,
   signInProvider: (input: ProviderProfileInput): Promise<ProviderSignInResult> =>

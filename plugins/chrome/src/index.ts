@@ -12,6 +12,8 @@ import { restoreFileOf, restoreVisibleSession, saveVisibleSession } from './rest
 import { createLogger } from './logger.js'
 import type { Logger } from './logger.js'
 import { createProfileStore } from './profiles/store.js'
+import { createSharedProfileStore } from './profiles/sharedStore.js'
+import { sharedProfilesRelease, sharedProfilesReleased } from './sharedProfilesRelease.js'
 import type { ProfileStore } from './profiles/store.js'
 export function createChromeBrowser(
   store: ProfileStore,
@@ -22,12 +24,19 @@ export function createChromeBrowser(
 ): ChromeBrowser {
   return new ChromeBrowser({
     dirOf: store.dirOf,
+    ...(store.shared
+      ? { acquireLease: store.shared.acquire, authorization: store.shared.authorization }
+      : {}),
     profileExists: (name) => store.get(name) !== undefined,
     logger,
     ...(idleMs !== undefined ? { idleMs } : {}),
     ...(browser ? { browser } : {}),
     extensionsFor: (name) => store.get(name)?.allowExtensions === true,
     syncFor: (name) => store.get(name)?.allowSync === true,
+    helperFor: (name) => store.get(name)?.helper ?? 'on',
+    rememberHelper: (name, helper) => {
+      if (store.get(name) && store.get(name)?.helper !== helper) store.setHelper(name, helper)
+    },
     keepRunningFor: (name) => {
       const r = store.get(name)
       return r?.keepRunning === true && !r.temporary
@@ -46,6 +55,17 @@ export function createChromeBrowser(
     ...over,
   })
 }
+export function createConfiguredProfileStore(config: AgentChromeConfig): ProfileStore {
+  return config.shared && sharedProfilesReleased(process.platform, sharedProfilesRelease)
+    ? createSharedProfileStore({
+        home: config.home,
+        shared: config.shared.root,
+        workspaceId: config.shared.workspaceId,
+        workspaceLabel: config.shared.workspaceLabel,
+        migrationApproved: true,
+      })
+    : createProfileStore({ home: config.home })
+}
 async function main(): Promise<void> {
   const logger = createLogger('agent-chrome')
   let running: RunningAgentChrome
@@ -54,11 +74,14 @@ async function main(): Promise<void> {
   let store: ProfileStore
   try {
     config = loadConfig(process.env)
-    store = createProfileStore({ home: config.home })
+    store = createConfiguredProfileStore(config)
     browser = createChromeBrowser(store, logger, undefined, config.browser, {
       noSandbox: config.noSandbox,
       noTestType: config.noTestType,
       downloadsRoot: config.downloadsRoot,
+      ...(config.shared ? { helperDir: () => path.join(config.shared!.root, 'helper') } : {}),
+      // The package ships the helper beside server.mjs; the working folder never matters.
+      helperSource: fileURLToPath(new URL('./helper/', import.meta.url)),
     })
     running = await startAgentChrome(config, { browser, store, logger })
   } catch (e) {
@@ -86,6 +109,7 @@ async function main(): Promise<void> {
         },
         undefined,
         logger,
+        store.shared ? (name) => store.shared!.identity(name) : undefined,
       )
       await browser.closeAll()
     },

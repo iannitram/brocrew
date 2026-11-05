@@ -796,6 +796,8 @@ export type TurnProvenance =
  *    is eventually answered — by the app, or safe-rejected on teardown.
  */
 export interface SessionHandle {
+  /** The admitted app connection for this launch; older adapters may not provide attribution. */
+  readonly connectionId?: string
   /**
    * True after this adapter has begun retiring its provider, before its final status arrives.
    * The host must carry deliveries past that interval instead of sending into an idle-looking
@@ -805,7 +807,14 @@ export interface SessionHandle {
   /** Whether this launch's SDK init confirmed the installed skill catalogue. */
   builtInSkillsConfirmed?(): boolean
   /** Refresh only at a turn boundary; absent means this provider needs a managed reopen. */
-  refreshManagedPlugins?(servers: readonly ManagedPluginMcpServer[]): Promise<void>
+  refreshManagedPlugins?(
+    servers: readonly ManagedPluginMcpServer[],
+    reconnect?: readonly string[],
+  ): Promise<void>
+  /** Fresh failed managed-server names; empty means ready, undefined means unknown. */
+  managedPluginHealth?(
+    servers: readonly ManagedPluginMcpServer[],
+  ): Promise<readonly string[] | undefined>
 
   /**
    * Stable, persistable identity for this session, or `null` until a real,

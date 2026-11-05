@@ -452,3 +452,36 @@ it('passes bounded supervisor exit/stderr to the card and refuses multiline or e
   }
   expect(f.controller.install).not.toHaveBeenCalled()
 })
+
+it('reads current tool health without refreshing the catalogue or cancelling a person review', async () => {
+  const f = setup()
+  f.controller.catalogue = vi.fn(async (): Promise<PluginCard[]> => [
+    { id: 'chrome', name: 'Chrome', installed: true, state: 'Running', toolsUnavailable: true },
+  ])
+  f.controller.cancelPreparations = vi.fn()
+  expect(await f.call({ kind: 'status' })).toMatchObject({
+    ok: true,
+    cards: [{ state: 'Running', toolsUnavailable: true }],
+  })
+  expect(f.controller.catalogue).toHaveBeenCalledWith(false)
+  expect(f.controller.cancelPreparations).not.toHaveBeenCalled()
+})
+
+it('routes Chrome restart only from its owned Settings frame to the separate lifecycle recovery seam', async () => {
+  const f = setup(),
+    restart = vi.fn(async () => {})
+  Object.assign(f.controller, { restartChrome: restart })
+  expect(await f.call({ kind: 'restart', id: 'chrome' })).toMatchObject({ ok: true })
+  expect(restart).toHaveBeenCalledOnce()
+  for (const input of [
+    { kind: 'restart', id: 'whatsapp' },
+    { kind: 'restart', id: 'chrome', force: true },
+  ])
+    expect(await f.call(input)).toMatchObject({ ok: false })
+  expect(
+    await f.call({ kind: 'restart', id: 'chrome' }, { ...f.event, senderFrame: {} }),
+  ).toMatchObject({ ok: false })
+  expect(restart).toHaveBeenCalledOnce()
+  expect(f.controller.install).not.toHaveBeenCalled()
+  expect(f.controller.uninstall).not.toHaveBeenCalled()
+})

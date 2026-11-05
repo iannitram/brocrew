@@ -1,3 +1,4 @@
+import { recordPluginToolFailure } from '../tool-diagnostics'
 import { sharedLifecycleWorkspaces } from './workspaces'
 import { createLifecycleAgentBridge } from './agent-bridge'
 import { pluginToolRefusalLog } from './chrome-broker'
@@ -23,10 +24,12 @@ export async function createSupervisorLifecycle(options: {
   const controller = sharedLifecycleWorkspaces(
     await PluginLifecycleController.open({
       ...options.lifecycle,
+      toolsUnavailable: (id) => consumer.agents?.toolsUnavailable(id) ?? false,
       deny(id) {
         consumer.agents?.deny(id)
         options.lifecycle.deny(id)
       },
+      onChromeHostExit: (runId) => consumer.agents?.hostExited(runId),
       runtime: {
         start: (spec) => host.prepare(spec),
         removeCode: (id, digest) => options.host.removePackage(id, digest),
@@ -40,22 +43,31 @@ export async function createSupervisorLifecycle(options: {
   const agents = createLifecycleAgentBridge({
     owner: options.owner,
     controller,
-    binding: (view) => requirePluginAdapter(view.installation.pluginId).broker(view, refused),
+    binding: (view, diagnostic) =>
+      requirePluginAdapter(view.installation.pluginId).broker(view, refused, diagnostic),
+    diagnostic: (id, reason) => recordPluginToolFailure(options.lifecycle.root, id, reason),
     refused,
+    recoverChromeHost: (view, stopped) => controller.restartChromeTools(view.runId, stopped),
+    restartChromeHost: () => controller.restartChromeTools(undefined, () => {}),
   })
   consumer.agents = agents
   options.owner.bindAgentBridge(agents)
   let closed = false
   let closing: Promise<void> | undefined
   let exited!: () => void
-  const done = new Promise<void>((resolve) => {
+  let failed!: (error: unknown) => void
+  const done = new Promise<void>((resolve, reject) => {
     exited = resolve
+    failed = reject
   })
+  // close() may fail before the owner starts its own drain. Keep the negative witness observed.
+  void done.catch(() => undefined)
   const bridge = await servePersonPluginControl({
     root: options.lifecycle.root,
     key: options.personKey,
     controller,
     read: options.read,
+    restartChrome: () => agents.restartChrome(),
   })
   function close(): Promise<void> {
     closing ??= (async () => {
@@ -80,12 +92,18 @@ export async function createSupervisorLifecycle(options: {
         throw new PluginSupervisorError('cleanup-pending')
       closed = true
       exited()
-    })()
+    })().catch((error: unknown) => {
+      // A failed bridge stop is a negative exit witness, not a promise that can never settle.
+      // The owner retains its fence as blocked; it must never publish a false clean stop.
+      failed(error)
+      throw error
+    })
     return closing
   }
   // The owner waits for consumer/UI cleanup along with the real host children at last-lease drain.
   try {
     await options.owner.startChild(async () => ({
+      inProcess: true,
       stop: close,
       exited: done,
       descendantsGone: async () => closed,

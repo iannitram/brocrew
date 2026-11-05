@@ -27,6 +27,7 @@ import type {
   PluginStartupDiagnostic,
 } from '../../shared/plugin-settings'
 import { thisMachine, type PluginTarget } from './package-schema'
+import type { SharedDataOwner } from './shared-data'
 
 /** Stable Settings/discovery facade. Repo fetch and plugin startup never block normal agents. */
 export function productionPluginController() {
@@ -111,7 +112,7 @@ export function productionPluginController() {
       acceptingBusy.observedAt - acceptingBusy.since >= 120_000
     const specific = conditionalWindowAdvice
       ? 'owner-window-open'
-      : failure === 'restart-required'
+      : failure === 'restart-required' || failure === 'previous-service-stopping'
         ? failure
         : undefined
     return listed.map((entry) => ({
@@ -133,6 +134,12 @@ export function productionPluginController() {
   let refreshFailed = false
   let listFailure: PluginListError | undefined
   let catalogueEntries: Awaited<ReturnType<typeof loadRepoPluginList>>
+  // A one-use first-Settings allowance, never a disk cache or a new mutation authority.
+  // Count freshness from the verified load, including time spent finishing startup.
+  const startupCatalogueFreshMs = 30_000
+  let catalogueLoadedAt: number | undefined
+  let startupCatalogueVerifiedAt: number | undefined
+  let firstSettingsList = true
   let frozenCatalogue: typeof catalogueEntries | undefined
   let sourceVersion: 1 | 2 = 1
   const fail = (): never => {
@@ -141,6 +148,7 @@ export function productionPluginController() {
   let names: Readonly<Record<string, string>> = {}
   let loadCatalogue: (() => Promise<typeof catalogueEntries>) | undefined
   const markUnavailable = () => {
+    startupCatalogueVerifiedAt = undefined
     entries =
       entries?.map((one) => ({ ...one, state: 'Unavailable', tools: 'none', service: null })) ??
       null
@@ -270,12 +278,13 @@ export function productionPluginController() {
         name: names[card.id] ?? card.id,
         description: catalogueEntries!.entries.find((one) => one.id === card.id)?.description,
         state: card.state,
-        tools: card.state === 'Running' ? 'all agents' : 'none',
+        tools: card.state === 'Running' && !card.toolsUnavailable ? 'all agents' : 'none',
         service: card.state === 'Running' ? (names[card.id] ?? card.id) : null,
       }))
       return cards
     } catch (error) {
       if (ended || connected !== connection) return fail()
+      startupCatalogueVerifiedAt = undefined
       failed('catalogue-response', error)
       // Preserve a still-live channel for explicit retry/quit to detach with its acknowledgments.
       entries =
@@ -298,7 +307,21 @@ export function productionPluginController() {
     if (ended || !entries) return fail()
     if (!connected || cleanupUncertain) return unavailableCards()
     try {
-      if (refreshList) {
+      const startupStillFresh = () => {
+        const now = performance.now()
+        return (
+          startupCatalogueVerifiedAt !== undefined &&
+          now >= startupCatalogueVerifiedAt &&
+          now - startupCatalogueVerifiedAt < startupCatalogueFreshMs
+        )
+      }
+      const reuseStartup =
+        firstSettingsList &&
+        startupStillFresh() &&
+        !refreshFailed &&
+        (catalogueEntries.format !== 2 || connected.mutationStatus?.() === null)
+      if (refreshList) firstSettingsList = false
+      if (refreshList && !reuseStartup) {
         refreshFailed = false
         const connection = current()
         if (loadCatalogue && connection.refreshCatalogue) {
@@ -319,7 +342,18 @@ export function productionPluginController() {
           }
         }
       }
-      return (await update())!
+      const cards = (await update())!
+      if (
+        refreshList &&
+        reuseStartup &&
+        (!startupStillFresh() ||
+          (catalogueEntries.format === 2 && connected?.mutationStatus?.() !== null))
+      ) {
+        // The authenticated read can outlast freshness or invalidate source status. The allowance is
+        // already consumed, so this takes the normal refresh/failure path exactly once.
+        return await catalogue(true)
+      }
+      return cards
     } catch (error) {
       if (ended) return fail()
       if (error instanceof PluginListError) throw error
@@ -372,15 +406,27 @@ export function productionPluginController() {
     },
     async retry(id) {
       if (ended || !entries?.some((entry) => entry.id === id)) return fail()
+      // A person's Try again must never spend the first-list allowance.
+      firstSettingsList = false
+      startupCatalogueVerifiedAt = undefined
+      // An older list may still be awaiting the peer we are about to detach.
+      // Its promise must not become the successor's explicit refresh.
+      catalogueRefresh = undefined
       recover()
       await enter(true)
       if (ended || !entries) return fail()
       if (!connected || cleanupUncertain) return unavailableCards()
       try {
-        return await update()
+        return await facade.catalogue(true)
       } catch {
         return unavailableCards()
       }
+    },
+    async restartChrome() {
+      const connection = current()
+      if (!connection.restartChrome) return fail()
+      await connection.restartChrome()
+      await update()
     },
     async update(id, consent) {
       const connection = current()
@@ -424,6 +470,7 @@ export function productionPluginController() {
       devSource?: DevPluginSource
       supervisor: PluginSupervisorAttachment
       target?: PluginTarget
+      sharedDataOwner?: SharedDataOwner
     }): void {
       if (ended || started) return
       started = true
@@ -439,6 +486,7 @@ export function productionPluginController() {
         }
       }
       initialize = async () => {
+        startupCatalogueVerifiedAt = undefined
         let phase: PluginUnavailableReason = 'storage'
         let attempt: Peer | undefined
         let storage: SupervisorStorage | undefined
@@ -448,8 +496,8 @@ export function productionPluginController() {
           diagnosticRoot = options.root
           phase = 'catalogue'
           const devSource = await devPluginSource(options.devSource)
-          loadCatalogue = () =>
-            loadRepoPluginList({
+          loadCatalogue = async () => {
+            const next = await loadRepoPluginList({
               root: options.root,
               appVersion: options.appVersion,
               fixtureSource: options.fixtureSource,
@@ -458,6 +506,9 @@ export function productionPluginController() {
               signal: lifetime.signal,
               sourceVersion,
             })
+            catalogueLoadedAt = performance.now()
+            return next
+          }
           if (!catalogueEntries || !options.supervisor.holdsLease()) {
             try {
               catalogueEntries = await loadCatalogue()
@@ -503,6 +554,8 @@ export function productionPluginController() {
             root: options.root,
             workspaceRoots: [options.workspaceRoot],
             resourcesRoot: options.resourcesRoot,
+            sharedDataOwner:
+              options.fixtureSource || devSource ? undefined : options.sharedDataOwner,
             // Windows names no Chrome a plugin process could find by itself (see windows-chrome.ts).
             browserExecutable:
               options.browserExecutable ??
@@ -655,6 +708,7 @@ export function productionPluginController() {
             return false
           }
           await update()
+          startupCatalogueVerifiedAt = catalogueLoadedAt
           acceptingBusy = undefined
           timer = setInterval(() => {
             if (!refresh)

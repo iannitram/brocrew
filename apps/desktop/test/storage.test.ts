@@ -47,6 +47,52 @@ async function file(path: string, bytes: number): Promise<void> {
   await writeFile(path, Buffer.alloc(bytes, 65))
 }
 
+it('accounts for shared plugin data as a separate trusted plugin root and keeps other parts contained', async () => {
+  const shared = join(folder, 'machine-shared')
+  roots = { ...roots, sharedPlugins: shared }
+  await file(join(roots.plugins!, 'local'), 11)
+  await file(join(shared, 'chrome', 'profile'), 23)
+  const reading = await new StorageEngine(roots).measure()
+  expect(reading.parts.find((part) => part.id === 'plugins')?.bytes).toBe(34)
+  expect(
+    (await new StorageEngine(roots).children({ part: 'plugins', segments: [] })).entries,
+  ).toEqual([
+    { name: 'machine-shared', bytes: 23, isDirectory: true },
+    { name: 'plugins', bytes: 11, isDirectory: true },
+  ])
+  expect(
+    (
+      await new StorageEngine(roots).children({
+        part: 'plugins',
+        segments: ['machine-shared', 'chrome'],
+      })
+    ).totalBytes,
+  ).toBe(23)
+  expect(
+    await new StorageEngine(roots).reveal({
+      part: 'plugins',
+      segments: ['machine-shared', 'chrome'],
+    }),
+  ).toEqual({ path: await realpath(join(shared, 'chrome')) })
+  expect(
+    (
+      await new StorageEngine({ ...roots, workspace: shared }).children({
+        part: 'workspace',
+        segments: [],
+      })
+    ).error,
+  ).toBe('outside-data')
+  await symlink(folder, join(shared, 'escape'), process.platform === 'win32' ? 'junction' : 'dir')
+  expect(
+    (
+      await new StorageEngine(roots).children({
+        part: 'plugins',
+        segments: ['machine-shared', 'escape'],
+      })
+    ).error,
+  ).toBe('linked-path')
+})
+
 it('measures logical bytes from the host roots, including database sidecars and recovery, without counting unrelated files', async () => {
   await file(join(roots.workspace, 'nested', 'file'), 13)
   await file(roots.database[0]!, 21)
@@ -409,6 +455,24 @@ class FakeWorker extends EventEmitter {
   terminate = vi.fn(async () => 0)
 }
 
+it('allows bounded measurements of several slow parts while keeping drill requests short', async () => {
+  vi.useFakeTimers()
+  const workers: FakeWorker[] = []
+  const service = new StorageService(roots, () => {
+    const worker = new FakeWorker()
+    workers.push(worker)
+    return worker
+  })
+  const measure = service.run({ kind: 'measure' })
+  const drill = service.run({ kind: 'children', location: { part: 'backups', segments: [] } })
+  await vi.advanceTimersByTimeAsync(16_000)
+  expect(await drill).toEqual({ ok: false, error: 'limit' })
+  expect(workers[0]!.terminate).not.toHaveBeenCalled()
+  workers[0]!.emit('message', { ok: true, value: { totalBytes: 41 } })
+  expect(await measure).toEqual({ ok: true, value: { totalBytes: 41 } })
+  service.close()
+})
+
 it('retains its two worker permits until confirmed exit after abort, failure and timeout', async () => {
   vi.useFakeTimers()
   const workers: FakeWorker[] = []
@@ -488,6 +552,36 @@ function harness() {
   }
 }
 
+it('prunes backups only for app windows, serializes repeat clicks, and reports failures', async () => {
+  const h = harness()
+  let permitted = false
+  let finish!: () => void
+  const prune = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve
+      }),
+  )
+  const service = { close: vi.fn() } as unknown as StorageService
+  const stop = registerStorageIpc(h.ipc, service, {
+    reveal: () => {},
+    clearCache: async () => {},
+    pruneBackups: prune,
+    isAppWindow: () => permitted,
+  })
+  expect(await h.invoke(STORAGE_CHANNELS.pruneBackups)).toEqual({ ok: false, error: 'unavailable' })
+  expect(prune).not.toHaveBeenCalled()
+  permitted = true
+  const pending = h.invoke(STORAGE_CHANNELS.pruneBackups)
+  expect(prune).toHaveBeenCalledOnce()
+  expect(await h.invoke(STORAGE_CHANNELS.pruneBackups)).toEqual({ ok: false, error: 'busy' })
+  finish()
+  expect(await pending).toEqual({ ok: true })
+  prune.mockRejectedValueOnce(new Error('fictional disk error'))
+  expect(await h.invoke(STORAGE_CHANNELS.pruneBackups)).toEqual({ ok: false, error: 'unavailable' })
+  stop()
+})
+
 it('cache clear uses only the narrow cache API and preserves unrelated state in fake data', async () => {
   const cacheFile = join(roots.cache!, 'http')
   const kept = [
@@ -509,6 +603,7 @@ it('cache clear uses only the narrow cache API and preserves unrelated state in 
   })
   const reveal = vi.fn()
   const stop = registerStorageIpc(h.ipc, service, {
+    pruneBackups: async () => {},
     clearCache: () => clearHttpCache(service, clear),
     reveal,
     isAppWindow: () => true,
@@ -570,6 +665,7 @@ it('refuses native cache clear when its mapped root is linked or outside the dat
     } as unknown as StorageService
     const clear = vi.fn(async () => {})
     const stop = registerStorageIpc(h.ipc, service, {
+      pruneBackups: async () => {},
       clearCache: () => clearHttpCache(service, clear),
       reveal: () => {},
       isAppWindow: () => true,
@@ -594,6 +690,7 @@ it('rejects foreign senders and malformed IPC; cancels reads on navigation and r
   const clear = vi.fn(async () => {})
   let permitted = false
   const stop = registerStorageIpc(h.ipc, service, {
+    pruneBackups: async () => {},
     clearCache: clear,
     reveal: () => {},
     isAppWindow: () => permitted,
@@ -628,6 +725,7 @@ it.each(['did-navigate', 'render-process-gone', 'destroyed'])(
       close: vi.fn(),
     } as unknown as StorageService
     const unregister = registerStorageIpc(h.ipc, service, {
+      pruneBackups: async () => {},
       clearCache: async () => {},
       reveal: () => {},
       isAppWindow: () => true,
@@ -662,11 +760,13 @@ it('the preload forwards only the declared Storage methods and typed locations',
   await bridge.children(location)
   await bridge.reveal(location)
   await bridge.clearCache()
+  await bridge.pruneBackups()
   expect(Object.isFrozen(bridge)).toBe(true)
   expect(invoke.mock.calls).toEqual([
     [STORAGE_CHANNELS.measure],
     [STORAGE_CHANNELS.children, location],
     [STORAGE_CHANNELS.reveal, location],
     [STORAGE_CHANNELS.clearCache],
+    [STORAGE_CHANNELS.pruneBackups],
   ])
 })

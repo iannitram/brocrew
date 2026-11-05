@@ -1,8 +1,13 @@
+import type { ProviderHomesReprovision } from '../../shared/runtime-ipc'
 import { providerKnowledge } from '../providers/knowledge-definitions'
 import { legacyAccountRecordFormat, providerAuthPolicies } from '../providers/auth-definitions'
 import type { IdentityFact, ProviderAuthPolicy } from '../providers/auth-policy'
 import { providerDefinitions } from '../providers/definitions'
-import { StoppedBeforeSend, withManagedPluginAttachments } from '@brobot2/runtime'
+import {
+  RejectedSessionLaunch,
+  StoppedBeforeSend,
+  withManagedPluginAttachments,
+} from '@brobot2/runtime'
 import type { WorkspacePluginAttachments } from '../plugins/attachments'
 import {
   libraryUnavailable,
@@ -177,6 +182,7 @@ import {
   providerRecord,
   providerSchema,
   type Provider,
+  type ProviderConnection,
   type SessionStatus,
 } from '@brobot2/shared'
 import { assetUrl } from '../../shared/asset-url'
@@ -546,6 +552,11 @@ function oauthPortKey(provider: Provider, profileId: string): string {
 
 function credentialHomeKey(home: string): string {
   return `credential:${home}`
+}
+
+/** A switch belongs to one home even when OAuth ports are shared. */
+function profileSignInKey(provider: Provider, profileId: string): string {
+  return `${provider}:${profileId}`
 }
 
 /** One provider's catalogue in one profile's home — the cache key {@link RuntimeHost.providerModels} keeps. */
@@ -2536,7 +2547,11 @@ export interface RuntimeHostDeps {
   /** Records synchronous work without timing provider waits. */
   mainThreadWork?: Pick<MainThreadWork, 'start' | 'timed'>
   /** The adapter for a provider, already wired with its auth seam. */
-  createRuntime(provider: Provider): AgentRuntime
+  createRuntime(provider: Provider, connectionId?: string): AgentRuntime
+  /** Resolve metadata before home/provider work; absence preserves legacy test/runtime wiring. */
+  connectionFor?(provider: Provider, recordedConnection?: string | null): string
+  connectionRevision?(provider: Provider): number
+  listConnections?(): readonly ProviderConnection[]
   /**
    * Provision the app-owned home for a provider IN A GIVEN PROFILE and return its path.
    * The profile is passed rather than pinned because it decides what the provider remembers:
@@ -10392,6 +10407,8 @@ export class RuntimeHost implements LiveHost {
       settle,
     }
     this.slots.set(id, slot)
+    if (slot.provider !== null && profileId !== null)
+      this.rememberHomeLaunch(slot.provider, profileId, slot.launch)
     // ⚑ **D-019 · a reservation whose provider has not come up is *active*.**
     this.stateMayHaveMoved(id)
     return slot
@@ -13540,6 +13557,8 @@ export class RuntimeHost implements LiveHost {
     // ELSE's session if the id had been re-taken, while we were only trying to let go of ours.
     this.abandon(slot)
     const closing = (async () => handle.close())().catch((error: unknown) => {
+      const home = this.homeLaunches.get(slot.launch)
+      if (home !== undefined) home.uncertain = true
       console.warn(
         `runtime session ${slot.id} failed to close while starting: ${errorMessage(error)}`,
       )
@@ -13554,7 +13573,7 @@ export class RuntimeHost implements LiveHost {
     // ⛔ **And until 233 that last sentence was false here for Claude** (229 H1): `closing` is a
     // bounded teardown, not a receipt, so this path released the id while the CLI child was alive —
     // on the very gesture the comment above describes. {@link terminationOf} is the rule.
-    this.launches.finish(slot.launch, this.terminationOf(handle, closing))
+    this.launches.finish(slot.launch, this.terminationOf(handle, closing, slot.launch))
     if (!(await settledWithin(closing, this.closeDrainTimeoutMs))) {
       console.warn(
         `runtime session ${slot.id}: the provider arrived after the session was closed and did not ` +
@@ -13650,6 +13669,8 @@ export class RuntimeHost implements LiveHost {
       timing.end('ready')
       return handle
     } catch (error) {
+      const terminated = this.rejectedConnectionTermination(error, slot.launch)
+      if (terminated !== undefined) this.launches.finish(slot.launch, terminated)
       timing.end(slot.launch.signal.aborted ? 'cancelled' : 'failed')
       // An aborted launch rejects with whatever the ADAPTER chose to say — `codex start was
       // cancelled`, a `ResumeError` wrapping it — and that is a raw provider string one press of
@@ -13745,16 +13766,15 @@ export class RuntimeHost implements LiveHost {
           // used to be the registry's release signal — and "the teardown threw" is not evidence that
           // the child died. Holding is the conservative half of the same trade `runFinalize` makes.
           const closing = (async () => handle.close())().catch((error: unknown) => {
+            const home = this.homeLaunches.get(slot.launch)
+            if (home !== undefined) home.uncertain = true
             console.warn(
               `runtime session ${slot.id} failed to close after being given up on: ${errorMessage(error)}`,
             )
           })
-          await this.terminationOf(handle, closing)
+          await this.terminationOf(handle, closing, slot.launch)
         },
-        () => {
-          // It rejected, which the signal contract says means the adapter has already torn down
-          // what it built. Nothing left to own; letting the entry go is what releases the id.
-        },
+        (error: unknown) => this.rejectedConnectionTermination(error, slot.launch),
       ),
     )
   }
@@ -13950,10 +13970,8 @@ export class RuntimeHost implements LiveHost {
       return await this.startSession(slot, input, sink ?? NO_SURFACE, spawn)
     } catch (error) {
       this.abandon(slot)
-      // Nothing is running: the {@link ProviderRuntimeContext.signal} contract requires an adapter
-      // to tear down what it built BEFORE rejecting, so a rejected launch has left no process. On
-      // the hand-back path this is already a no-op — `finish` is idempotent and the first call, the
-      // one that carries the termination promise, is the one that counts.
+      // Refused connection handles already handed their termination to the launch registry.
+      // Other adapters tear down before rejecting. The first finish call retains ownership.
       this.launches.finish(slot.launch)
       throw this.refusalTranslated(this.aRefusalAPersonReads(error, id))
     } finally {
@@ -24249,6 +24267,18 @@ export class RuntimeHost implements LiveHost {
     profileId: string,
     sessionId?: string,
   ): Promise<{ readonly home: string; readonly loginRenewed: boolean }> {
+    const barrier = this.homeCopyBarriers.get(profileSignInKey(provider, profileId))
+    const launch = sessionId === undefined ? undefined : this.slots.get(sessionId)?.launch
+    if (barrier !== undefined) {
+      if (launch !== undefined) this.homeCopyWaitingLaunches.add(launch)
+      void this.copyHomeWhenIdle(provider, profileId)
+      try {
+        await barrier.ready
+      } finally {
+        if (launch !== undefined) this.homeCopyWaitingLaunches.delete(launch)
+      }
+    }
+    await this.homeCopyJobs.get(profileSignInKey(provider, profileId))
     const renewedForIt = sessionId !== undefined && this.renewedForItsReopen.delete(sessionId)
     const prepare = (): string | Promise<string> =>
       this.deps.prepareProviderHome(provider, profileId)
@@ -24320,6 +24350,11 @@ export class RuntimeHost implements LiveHost {
     }
   }
 
+  private assertConnectionUnchanged(provider: Provider, revision: number | undefined): void {
+    if (revision !== undefined && this.deps.connectionRevision?.(provider) !== revision)
+      throw new Error('The selected connection changed during preparation')
+  }
+
   private runtimeWithPlugins(
     runtime: AgentRuntime,
     provider: Provider,
@@ -24367,7 +24402,16 @@ export class RuntimeHost implements LiveHost {
     // ⚑ **A folder a person or the spawn rails named, else the durable workspace** — `resolveCwd`'s
     // blank branch, which is where every conversation that asked for none runs.
     const cwd = this.deps.resolveCwd(id, input.cwd)
-    const { home: providerHome, loginRenewed } = await this.prepareAHome(input.provider, profileId)
+    const connectionId = recorded
+      ? this.deps.connectionFor?.(input.provider, this.deps.store.connectionOf(id))
+      : this.deps.connectionFor?.(input.provider)
+    const connectionRevision = this.deps.connectionRevision?.(input.provider)
+    const { home: providerHome, loginRenewed } = await this.prepareAHome(
+      input.provider,
+      profileId,
+      id,
+    )
+    this.assertConnectionUnchanged(input.provider, connectionRevision)
     // ⛔ **Asked again now the home exists, because the first answer was about a different disk**
     // (265 §4). The claim above covers every creation in THIS host; a variant laid down while we
     // waited — another BroBot tree over the same `userData`, or a person making the directory — is
@@ -24395,7 +24439,10 @@ export class RuntimeHost implements LiveHost {
     // The runtime first: it is made with the program it runs, so a program this computer lacks is
     // refused here in its own words, before a model list is asked whose failure would read as a
     // list that names no model.
-    const rawRuntime = this.deps.createRuntime(input.provider)
+    const rawRuntime =
+      connectionId === undefined
+        ? this.deps.createRuntime(input.provider)
+        : this.deps.createRuntime(input.provider, connectionId)
     const runtime = this.runtimeWithPlugins(rawRuntime, input.provider, profileId)
     // 🔴 **D-042 · R1 — every start names its model and effort** (024's effort, 038's model): what
     // the caller named, else this agent's default, else the last pair a person picked on this
@@ -24473,6 +24520,7 @@ export class RuntimeHost implements LiveHost {
       { provider: input.provider, kind: 'fresh' },
       (startPhases) => {
         if (builtInSkills && !builtInSkills.isCurrent()) throw new Error(BUILT_IN_SKILLS_FAILURE)
+        this.assertConnectionUnchanged(input.provider, connectionRevision)
         return runtime.start({
           startPhases,
           cwd,
@@ -24585,6 +24633,7 @@ export class RuntimeHost implements LiveHost {
           if (recorded) {
             const launched = this.deps.store.firstLaunchOf({
               id,
+              ...(handle.connectionId === undefined ? {} : { connectionId: handle.connectionId }),
               model,
               ...(reasoningEffort ? { reasoningEffort } : {}),
               ...(planMode !== undefined ? { planMode } : {}),
@@ -24596,6 +24645,7 @@ export class RuntimeHost implements LiveHost {
           this.deps.store.create({
             id,
             provider: input.provider,
+            ...(handle.connectionId === undefined ? {} : { connectionId: handle.connectionId }),
             cwd,
             approvalMode,
             profileId,
@@ -25150,6 +25200,7 @@ export class RuntimeHost implements LiveHost {
     // carries `{mode:'default'}` with it, because that is how this transition has always travelled.
     // ⚑ Planning is one thing a reopen on the current sign-in waits for ({@link reopenForWhatWaits}).
     if (text === undefined) {
+      void this.copyHomeWhenIdle(session.provider, session.profileId)
       this.reopenForWhatWaits(session)
       return
     }
@@ -32084,6 +32135,10 @@ export class RuntimeHost implements LiveHost {
    * "unreachable"; there is a test now that pins it by making the two disagree.
    */
   private flushQueued(session: HostedSession): void {
+    if (this.homeCopies.get(session.provider)?.get(session.profileId)?.state === 'pending') {
+      void this.copyHomeWhenIdle(session.provider, session.profileId)
+      if (this.homeCopyJobs.has(profileSignInKey(session.provider, session.profileId))) return
+    }
     // A reopen for the tools a person approved goes before anything held: what is held goes in as
     // the conversation starts again.
     if (
@@ -35451,7 +35506,11 @@ export class RuntimeHost implements LiveHost {
     // ours — and it is the same sentence a refused session gets.
     let launch: Launch
     try {
+      let copying: Promise<void> | undefined
+      while ((copying = this.homeCopyJobs.get(profileSignInKey(provider, profileId))) !== undefined)
+        await copying
       launch = this.launches.open(`${provider} sign-in check`)
+      this.rememberHomeLaunch(provider, profileId, launch)
     } catch {
       // ⚠️ `unknown`, in this method's own vocabulary. A quit is one more way of not getting an
       // answer, and it says nothing at all about the credential (098's rule).
@@ -35524,6 +35583,199 @@ export class RuntimeHost implements LiveHost {
         ...this.logAuthDiagnostic('check', provider, error),
       }
     }
+  }
+
+  private readonly homeCopies = new Map<
+    Provider,
+    Map<string, ProviderHomesReprovision['profiles'][number]>
+  >()
+  private readonly homeCopyJobs = new Map<string, Promise<void>>()
+  private readonly homeCopyRestarts = new Map<string, Promise<void>>()
+  private readonly homeCopyBarriers = new Map<string, { ready: Promise<void>; release(): void }>()
+  private readonly homeLaunches = new Map<
+    Launch,
+    { provider: Provider; profileId: string; uncertain?: boolean }
+  >()
+  private readonly homeCopyWaitingLaunches = new Set<Launch>()
+
+  /** A launch keeps its home owned after its session slot goes, until process teardown settles. */
+  private rememberHomeLaunch(provider: Provider, profileId: string, launch: Launch): void {
+    this.homeLaunches.set(launch, { provider, profileId })
+    void launch.settled.then(() => {
+      if (this.homeLaunches.get(launch)?.uncertain !== true) this.homeLaunches.delete(launch)
+      this.homeCopyWaitingLaunches.delete(launch)
+      void this.copyHomeWhenIdle(provider, profileId)
+    })
+  }
+
+  private releaseHomeCopyBarrier(provider: Provider, profileId: string): void {
+    const key = profileSignInKey(provider, profileId)
+    this.homeCopyBarriers.get(key)?.release()
+    this.homeCopyBarriers.delete(key)
+  }
+
+  /** A person's batch request; pending homes are retried at an idle or termination boundary. */
+  async reprovisionProviderHomes(
+    provider: Provider,
+    statusOnly = false,
+  ): Promise<ProviderHomesReprovision> {
+    if (providerDescriptor(provider).credential !== 'profile-or-key')
+      throw new Error('This provider does not keep a separate sign-in for each agent.')
+    let rows = this.homeCopies.get(provider)
+    const restartActive = [...this.homeCopyRestarts.keys()].some((key) =>
+      key.startsWith(`${provider}:`),
+    )
+    if (
+      !statusOnly &&
+      !restartActive &&
+      ![...(rows?.values() ?? [])].some((one) => one.state === 'pending')
+    ) {
+      rows = new Map(
+        this.profiles(provider).map((profileId) => [
+          profileId,
+          { profileId, state: 'pending' as const },
+        ]),
+      )
+      this.homeCopies.set(provider, rows)
+      for (const profileId of rows.keys()) {
+        let release!: () => void
+        const ready = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        this.homeCopyBarriers.set(profileSignInKey(provider, profileId), { ready, release })
+      }
+      for (const profileId of rows.keys()) await this.copyHomeWhenIdle(provider, profileId)
+    }
+    const profiles = [...(rows?.values() ?? [])]
+    return {
+      replaced: profiles.filter((one) => one.state === 'replaced').length,
+      pending: profiles.filter((one) => one.state === 'pending').length,
+      skipped: profiles.filter((one) => one.state === 'skipped').length,
+      failed: profiles.filter((one) => one.state === 'failed').length,
+      profiles,
+    }
+  }
+
+  /** Stop idle app-servers before replacing their copy so a late refresh cannot overwrite it. */
+  private copyHomeWhenIdle(provider: Provider, profileId: string): Promise<void> {
+    const rows = this.homeCopies.get(provider)
+    const key = profileSignInKey(provider, profileId)
+    const current = this.homeCopyRestarts.get(key)
+    if (current) return current
+    if (rows?.get(profileId)?.state !== 'pending') return Promise.resolve()
+    const copying = this.homeCopyJobs.get(key)
+    if (copying) return copying
+    try {
+      if (this.deps.apiKeys?.status(provider).set === true) {
+        rows.set(profileId, { profileId, state: 'skipped', reason: 'api-key' })
+        this.releaseHomeCopyBarrier(provider, profileId)
+        return Promise.resolve()
+      }
+    } catch {
+      rows.set(profileId, { profileId, state: 'skipped', reason: 'key-status-unavailable' })
+      this.releaseHomeCopyBarrier(provider, profileId)
+      return Promise.resolve()
+    }
+    const stopFailed = () =>
+      [...this.homeLaunches.values()].some(
+        (home) =>
+          home.provider === provider && home.profileId === profileId && home.uncertain === true,
+      )
+    if (stopFailed()) {
+      rows.set(profileId, { profileId, state: 'failed', reason: 'stop-failed' })
+      this.releaseHomeCopyBarrier(provider, profileId)
+      return Promise.resolve()
+    }
+    const slots = [...this.slots.values()].filter(
+      (slot) =>
+        slot.provider === provider &&
+        slot.profileId === profileId &&
+        !this.homeCopyWaitingLaunches.has(slot.launch),
+    )
+    // Former slots can still own a process after a bounded teardown has returned.
+    if (
+      [...this.homeLaunches].some(
+        ([launch, home]) =>
+          home.provider === provider &&
+          home.profileId === profileId &&
+          !this.homeCopyWaitingLaunches.has(launch) &&
+          !slots.some((slot) => slot.launch === launch),
+      )
+    )
+      return Promise.resolve()
+    if (
+      slots.some(
+        (slot) =>
+          slot.session === null ||
+          onItsWayOut(slot) ||
+          this.aTurnRunsIn(slot.session) ||
+          this.whatAReopenWaitsFor(slot.session) !== null,
+      )
+    )
+      return Promise.resolve()
+    const sessions = slots.flatMap((slot) => (slot.session === null ? [] : [slot.session]))
+    for (const session of sessions) this.signInStops.add(session)
+    // Install the gate before closing a provider can admit another probe or launch.
+    let copied: ProviderHomesReprovision['profiles'][number] | undefined
+    let confirmedStopped = false
+    const job = Promise.resolve().then(async () => {
+      try {
+        await Promise.all(sessions.map((session) => this.close(session.id, THE_APP_ITSELF)))
+        await Promise.all(sessions.map((session) => session.terminated))
+        if (stopFailed()) throw new Error('Provider cleanup could not be confirmed')
+        confirmedStopped = true
+        const keyStatus = (): boolean => this.deps.apiKeys?.status(provider).set === true
+        // A key saved while the providers stopped outranks this request too.
+        if (keyStatus()) {
+          copied = { profileId, state: 'skipped', reason: 'api-key' }
+          return
+        }
+        const outcome = await this.reprovisionProviderAuth(provider, profileId)
+        copied =
+          outcome === 'replaced'
+            ? { profileId, state: 'replaced' }
+            : { profileId, state: 'skipped', reason: 'unchanged' }
+      } catch {
+        copied = {
+          profileId,
+          state: 'failed',
+          reason: confirmedStopped ? 'copy-failed' : 'stop-failed',
+        }
+      } finally {
+        this.homeCopyJobs.delete(key)
+        this.releaseHomeCopyBarrier(provider, profileId)
+      }
+    })
+    this.homeCopyJobs.set(key, job)
+    const restarting = job
+      .then(async () => {
+        for (const session of sessions) {
+          this.signInStops.delete(session)
+          if (!confirmedStopped || this.launches.closed || this.keptStopped(session.id)) continue
+          const alreadyStarting = this.slots.get(session.id)
+          if (alreadyStarting !== undefined) {
+            await alreadyStarting.arrived
+            if (this.slots.get(session.id)?.session == null)
+              copied = { profileId, state: 'failed', reason: 'restart-failed' }
+            continue
+          }
+          const watching =
+            session.sink.alive && session.sink.aPersonIsBehindIt ? session.sink : null
+          try {
+            await this.resumeSession(session.id, watching, null, undefined, 'not-read')
+          } catch {
+            const raced = this.slots.get(session.id)
+            if (raced !== undefined) await raced.arrived
+            if (this.slots.get(session.id)?.session == null)
+              copied = { profileId, state: 'failed', reason: 'restart-failed' }
+          }
+        }
+        if (rows.get(profileId)?.state === 'pending' && copied !== undefined)
+          rows.set(profileId, copied)
+      })
+      .finally(() => this.homeCopyRestarts.delete(key))
+    this.homeCopyRestarts.set(key, restarting)
+    return restarting
   }
 
   /**
@@ -36224,6 +36476,8 @@ export class RuntimeHost implements LiveHost {
     // An async wrapper, so an adapter that throws SYNCHRONOUSLY out of `close()` becomes a rejection
     // this can catch rather than an exception that escapes teardown entirely.
     const closing = (async () => session.handle.close())().catch((error: unknown) => {
+      const home = this.homeLaunches.get(session.launch)
+      if (home !== undefined) home.uncertain = true
       console.warn(`runtime session ${session.id} failed to close: ${errorMessage(error)}`)
     })
     // Kept UNBOUNDED and separately from the answer below (070). The boolean is how long we were
@@ -36232,7 +36486,7 @@ export class RuntimeHost implements LiveHost {
     //
     // ⛔ **Since 233 it is the FACT and not our own teardown** — see {@link terminationOf}, which is
     // the one place that rule lives.
-    session.terminated = this.terminationOf(session.handle, closing)
+    session.terminated = this.terminationOf(session.handle, closing, session.launch)
     // ⛔ **The bound is now measured against that**, and the single substitution is what makes the
     // consumers downstream honest: `closeAll()`'s warning becomes reachable because the registry is
     // still holding the launch when it looks.
@@ -36275,7 +36529,11 @@ export class RuntimeHost implements LiveHost {
    * it was. Upgrading an adapter that cannot say anything would be inventing evidence, which is the
    * defect this exists to remove.
    */
-  private terminationOf(handle: SessionHandle, teardown: Promise<void>): Promise<void> {
+  private terminationOf(
+    handle: SessionHandle,
+    teardown: Promise<void>,
+    launch?: Launch,
+  ): Promise<void> {
     // ⚠️ **Asked ONCE.** The contract says the method is idempotent, but calling it twice and
     // keeping one result would make "the fact" depend on which call the registry got.
     const exit = handle.awaitProcessExit?.()
@@ -36283,11 +36541,22 @@ export class RuntimeHost implements LiveHost {
     // `doStopProvider` is at the END of `runFinalize`, long after this. An adapter whose exit
     // promise rejected in between would be an unhandled rejection with nobody above it. Same reason
     // {@link boundedCancel} does this.
-    exit?.catch(() => {})
+    exit?.catch(() => {
+      const home = launch === undefined ? undefined : this.homeLaunches.get(launch)
+      if (home !== undefined) home.uncertain = true
+    })
     if (exit === undefined) return teardown
     return Promise.all([teardown, exit]).then(() => undefined)
   }
 
+  private rejectedConnectionTermination(error: unknown, launch: Launch): Promise<void> | undefined {
+    if (!(error instanceof RejectedSessionLaunch)) return undefined
+    return error.terminated.catch((cause: unknown) => {
+      const home = this.homeLaunches.get(launch)
+      if (home !== undefined) home.uncertain = true
+      throw cause
+    })
+  }
   /**
    * **The one place a session stops being owned** (051, from 048 §1 finding 3).
    *
@@ -36412,6 +36681,10 @@ export class RuntimeHost implements LiveHost {
     }
     // The reservation goes with the session: the id is free again only once nothing is left to own.
     this.slots.delete(session.id)
+    void Promise.resolve(session.terminated).then(
+      () => this.copyHomeWhenIdle(session.provider, session.profileId),
+      () => undefined,
+    )
     // ⚑ **D-019 · stopped: only its ledger speaks for it now**, read afresh when it is next asked.
     this.waitAsLastRead.delete(session.id)
     this.workOutAsLastRead.delete(session.id)
@@ -38745,6 +39018,20 @@ export class RuntimeHost implements LiveHost {
    */
   capabilities(): ProviderCapabilityMap {
     return allProviderCapabilities()
+  }
+
+  /** Return declared metadata only, without invoking any provider or credential operation. */
+  providerConnections(): readonly ProviderConnection[] {
+    return (this.deps.listConnections?.() ?? []).map((row) => ({
+      id: row.id,
+      provider: row.provider,
+      name: row.name,
+      authMethod: row.authMethod,
+      credentialSource: row.credentialSource,
+      baseUrl: row.baseUrl,
+      enabled: row.enabled,
+      contractVersion: row.contractVersion,
+    }))
   }
 
   /**
@@ -42342,12 +42629,17 @@ export class RuntimeHost implements LiveHost {
     // that ran short, said in words (`710`, {@link howAFailureReads}); the log keeps the errno.
     if (this.launches.closed) return { ok: false, reason: 'closing' }
     let providerHome: string
+    let connectionId: string | undefined
+    let connectionRevision: number | undefined
     try {
+      connectionId = this.deps.connectionFor?.(provider)
+      connectionRevision = this.deps.connectionRevision?.(provider)
       const preparation = this.launches.open(`${provider} model home preparation`)
       try {
         if (this.deps.beforeProviderLaunch) await this.deps.beforeProviderLaunch()
         preparation.signal.throwIfAborted()
         providerHome = await this.deps.prepareProviderHome(provider, profileId)
+        this.assertConnectionUnchanged(provider, connectionRevision)
       } finally {
         this.launches.finish(preparation)
       }
@@ -42359,14 +42651,21 @@ export class RuntimeHost implements LiveHost {
     }
     let launch: Launch | null = null
     try {
+      let copying: Promise<void> | undefined
+      while ((copying = this.homeCopyJobs.get(profileSignInKey(provider, profileId))) !== undefined)
+        await copying
       launch = this.launches.open(`${provider} model probe`)
+      this.rememberHomeLaunch(provider, profileId, launch)
       if (this.deps.beforeProviderLaunch) {
         await this.deps.beforeProviderLaunch()
         launch.signal.throwIfAborted()
       }
-      const listing = this.deps
-        .createRuntime(provider)
-        .listModels({ providerHome, signal: launch.signal })
+      this.assertConnectionUnchanged(provider, connectionRevision)
+      const runtime =
+        connectionId === undefined
+          ? this.deps.createRuntime(provider)
+          : this.deps.createRuntime(provider, connectionId)
+      const listing = runtime.listModels({ providerHome, signal: launch.signal })
       // Owned until the probe's own promise settles — both adapters close their child in a
       // `finally`, so that is the nearest thing to a termination receipt a probe has. Handed
       // over BEFORE the await, so a quit landing mid-probe finds it in the registry.
@@ -43411,11 +43710,17 @@ export class RuntimeHost implements LiveHost {
     // ⚑ `592` recorded that move deliberately: see `test/session-profile.test.ts`'s *"the path for
     // an omitted profile moved, and only because the SLUG did"*.
     const profileId = row.profileId ?? DEFAULT_PROFILE_ID
+    const connectionId = this.deps.connectionFor?.(
+      row.provider,
+      this.deps.store.connectionOf(sessionId),
+    )
+    const connectionRevision = this.deps.connectionRevision?.(row.provider)
     const { home: providerHome, loginRenewed } = await this.prepareAHome(
       row.provider,
       profileId,
       sessionId,
     )
+    this.assertConnectionUnchanged(row.provider, connectionRevision)
     // Null only for rows written before the mode was recorded, and for adopted ones we never
     // ran; those resume PROMPTING, which is the safe direction — never the other way round.
     const approvalMode = row.approvalMode ?? 'ask'
@@ -43454,7 +43759,10 @@ export class RuntimeHost implements LiveHost {
     const recordedModel = row.model ?? undefined
     // The runtime first, as a start makes it: a missing program is refused in its own words, never
     // as a list that names no model.
-    const rawRuntime = this.deps.createRuntime(row.provider)
+    const rawRuntime =
+      connectionId === undefined
+        ? this.deps.createRuntime(row.provider)
+        : this.deps.createRuntime(row.provider, connectionId)
     const runtime = this.runtimeWithPlugins(rawRuntime, row.provider, row.profileId)
     const selected = await this.theSelectedModel(row.provider, row.profileId, profileId, {
       ...(recordedModel === undefined ? {} : { model: recordedModel }),
@@ -43547,6 +43855,7 @@ export class RuntimeHost implements LiveHost {
           ).catch(() => null)
         }
         if (builtInSkills && !builtInSkills.isCurrent()) throw new Error(BUILT_IN_SKILLS_FAILURE)
+        this.assertConnectionUnchanged(row.provider, connectionRevision)
         return runtime.resume(row.ref, {
           startPhases,
           providerHome,
@@ -47370,7 +47679,10 @@ export class RuntimeHost implements LiveHost {
     if (event.type === 'status' && event.state === 'idle') this.flushQueued(session)
     // ⚑ **Work that ran in the background is one thing a reopen on the current sign-in waits for**
     // — so a level that moved asks again ({@link reopenForWhatWaits}).
-    if (event.type === 'background_work') this.reopenForWhatWaits(session)
+    if (event.type === 'background_work') {
+      void this.copyHomeWhenIdle(session.provider, session.profileId)
+      this.reopenForWhatWaits(session)
+    }
   }
 
   /**

@@ -167,6 +167,31 @@ it('does not invent remote quiescence when an authenticated stream is cancelled'
   noPrivateCredential(f.audit, f.credential)
 })
 
+it('delivers the failed call before closing its route while retaining unknown remote quiescence', async () => {
+  const f = await fixture(),
+    route = await f.route('willow'),
+    client = new Client({ name: 'fictional', version: '1' })
+  cleanup.push(() => client.close())
+  client.onerror = () => undefined
+  f.reply('hold')
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(route.server.url), {
+      requestInit: { headers: { Authorization: `Bearer ${route.server.capability}` } },
+    }),
+  )
+  const pending = client
+    .callTool({ name: 'echo', arguments: { profile: 'fern' } }, undefined, { timeout: 1500 })
+    .catch(() => ({ lost: true }))
+  await vi.waitFor(() => expect(f.seen).toHaveLength(1))
+  await route.close()
+  const reply = await pending
+  expect(reply).toMatchObject({ isError: true })
+  await vi.waitFor(() => expect(f.broker.status().available).toBe(false), { timeout: 2000 })
+  expect(f.broker.status().awaitingQuiescence).toBe(true)
+  expect(f.broker.owner.hasCompletionProof()).toBe(false)
+  noPrivateCredential([reply, f.audit], f.credential)
+})
+
 it('keeps malformed downstream configuration errors closed', () => {
   const credential = 'fictional-private-'.repeat(4)
   let error: unknown
@@ -202,4 +227,86 @@ it('also suppresses a private admin credential in a successful tool result', asy
   const result = await client.callTool({ name: 'echo', arguments: { profile: 'fern' } })
   expect(result).toMatchObject({ isError: true })
   noPrivateCredential(result, extraPrivateCredential)
+})
+
+it('records a closed connect-failure reason without arguments, credentials or raw transport errors', async () => {
+  const reasons: string[] = []
+  const port = createPrivatePluginPort({
+    url: 'http://127.0.0.1:1/mcp',
+    credential: 'a'.repeat(64),
+    diagnostic: (reason) => reasons.push(reason),
+  })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw Object.assign(new Error('fictional-private-page-body'), {
+        cause: { code: 'ECONNRESET' },
+      })
+    }),
+  )
+  try {
+    const execution = port.tool(
+      {
+        identity: {
+          pluginId: 'chrome',
+          installId: 'fictional',
+          epoch: 'one',
+          workspaceId: 'fictional',
+          kind: 'agent',
+          incarnation: 'one',
+        },
+        name: 'echo',
+        input: { private: 'fictional-private-argument' },
+        resources: [],
+      },
+      new AbortController().signal,
+    )
+    await expect(execution.result).resolves.toEqual({ ok: false })
+    await expect(execution.quiescent).rejects.toThrow()
+    expect(reasons).toContain('transport-connect-failed')
+    expect(reasons).toContain('transport-connection-reset')
+    expect(JSON.stringify(reasons)).not.toMatch(/fictional-private|aaaaaaaa/)
+  } finally {
+    vi.unstubAllGlobals()
+  }
+})
+
+it('does not diagnose successful calls as failures when their per-call MCP streams close', async () => {
+  const reasons: string[] = []
+  const f = await pluginProviderFixture({ diagnostic: (reason) => reasons.push(reason) })
+  cleanup.push(() => f.close())
+  const route = await f.route('fictional-diagnostic'),
+    client = new Client({ name: 'fictional-success', version: '1' })
+  cleanup.push(() => client.close())
+  client.onerror = () => undefined
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(route.server.url), {
+      requestInit: { headers: { Authorization: `Bearer ${route.server.capability}` } },
+    }),
+  )
+  expect(await client.callTool({ name: 'echo', arguments: { profile: 'fern' } })).toMatchObject({
+    content: [{ text: PLUGIN_MARKER }],
+  })
+  await new Promise<void>((resolve) => setTimeout(resolve, 50))
+  expect(reasons).toEqual([])
+})
+
+it('still diagnoses an actual failed call even though its MCP client also closes', async () => {
+  const reasons: string[] = []
+  const f = await pluginProviderFixture({ diagnostic: (reason) => reasons.push(reason) })
+  cleanup.push(() => f.close())
+  f.reply('error')
+  const route = await f.route('fictional-failed'),
+    client = new Client({ name: 'fictional-failed', version: '1' })
+  cleanup.push(() => client.close())
+  client.onerror = () => undefined
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(route.server.url), {
+      requestInit: { headers: { Authorization: `Bearer ${route.server.capability}` } },
+    }),
+  )
+  expect(await client.callTool({ name: 'echo', arguments: { profile: 'fern' } })).toMatchObject({
+    isError: true,
+  })
+  expect(reasons).toContain('transport-call-failed')
 })
