@@ -623,8 +623,22 @@ describe('secret-free failures and diagnostics', () => {
     )
     for (const event of h.audit)
       expect(
-        Object.keys(event).every((key) => ['event', 'operation', 'queued', 'code'].includes(key)),
+        Object.keys(event).every((key) =>
+          ['event', 'operation', 'queued', 'code', 'reason'].includes(key),
+        ),
       ).toBe(true)
+    for (const event of h.audit)
+      if (event.reason !== undefined)
+        expect([
+          'proof-rejected',
+          'proof-timeout',
+          'cancel-failed',
+          'execution-invalid',
+          'reply-invalid',
+          'owner-invalidated',
+          'queue-deadline',
+          'call-deadline',
+        ]).toContain(event.reason)
     const logger = setup((o) => ({
       ...o,
       audit: () => {
@@ -825,4 +839,75 @@ it('does not dispatch when the caller aborts during preparation', async () => {
   expect(h.server.calls).toHaveLength(0)
   expect(h.broker.status()).toMatchObject({ executing: false, queued: 0 })
   expect(h.clock.timers.size).toBe(0)
+})
+
+it('audits every settled failure and distinguishes a rejected proof without retaining its error', async () => {
+  const h = setup()
+  const pending = h.call()
+  await tick()
+  h.server.calls[0]!.quiet.reject(new Error('fictional-private-proof-reason'))
+  await expect(pending).rejects.toMatchObject({ code: 'unavailable' })
+  expect(h.audit).toContainEqual(
+    expect.objectContaining({ event: 'unavailable', reason: 'proof-rejected' }),
+  )
+  expect(h.audit).toContainEqual(expect.objectContaining({ event: 'refused', code: 'unavailable' }))
+  expect(JSON.stringify(h.audit)).not.toContain('fictional-private-proof-reason')
+})
+
+it('distinguishes a queue deadline from a dispatched call deadline using fixed reasons', async () => {
+  const h = setup()
+  const first = h.call(),
+    second = h.call()
+  await tick()
+  h.clock.advance(120000)
+  await expect(first).rejects.toMatchObject({ code: 'deadline' })
+  await expect(second).rejects.toMatchObject({ code: 'deadline' })
+  expect(h.audit).toContainEqual(
+    expect.objectContaining({ event: 'refused', reason: 'call-deadline' }),
+  )
+  expect(h.audit).toContainEqual(
+    expect.objectContaining({ event: 'refused', reason: 'queue-deadline' }),
+  )
+  h.server.calls[0]!.quiet.resolve()
+  await tick()
+})
+
+it('offers replacement authority only after a failed call positively completes', async () => {
+  const h = setup()
+  const pending = h.call()
+  await tick()
+  h.clock.advance(120000)
+  await expect(pending).rejects.toMatchObject({ code: 'deadline' })
+  h.clock.advance(1000)
+  expect(h.broker.status()).toMatchObject({ available: false, awaitingQuiescence: true })
+  expect(h.broker.owner.hasCompletionProof()).toBe(false)
+  h.server.calls[0]!.quiet.resolve()
+  await tick()
+  expect(h.broker.status()).toMatchObject({ available: false, executing: false })
+  expect(h.broker.owner.hasCompletionProof()).toBe(true)
+})
+
+it('uses positive exact-host exit after a rejected call proof, never a rejected host proof', async () => {
+  const host = deferred<void>()
+  const h = setup((options) => Object.assign(options, { hostExited: host.promise }))
+  const pending = h.call()
+  await tick()
+  h.server.calls[0]!.quiet.reject(new Error('fictional unproved remote call'))
+  await expect(pending).rejects.toMatchObject({ code: 'unavailable' })
+  expect(h.broker.owner.hasCompletionProof()).toBe(false)
+  host.resolve()
+  await tick()
+  expect(h.broker.owner.hasCompletionProof()).toBe(true)
+  expect(h.broker.status()).toMatchObject({ available: false, executing: false })
+
+  const unknown = deferred<void>()
+  const other = setup((options) => Object.assign(options, { hostExited: unknown.promise }))
+  const active = other.call()
+  await tick()
+  unknown.reject(new Error('fictional unknown host exit'))
+  other.clock.advance(120000)
+  await expect(active).rejects.toThrow()
+  other.clock.advance(1000)
+  expect(other.broker.owner.hasCompletionProof()).toBe(false)
+  expect(other.broker.status()).toMatchObject({ available: false, awaitingQuiescence: true })
 })

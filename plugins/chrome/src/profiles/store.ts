@@ -1,6 +1,8 @@
 import fs from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { privateFolder } from '../privatePaths.js'
+import type { SharedProfileAccess } from './sharedTypes.js'
 import { PRIVATE } from '../privateModes.js'
 export const PROFILE_NAME = /^[a-z0-9-]{1,32}$/
 export interface ProfileFlags {
@@ -19,7 +21,12 @@ export const FLAG_NAMES = [
 ] as const
 export type CreatedBy = 'agent' | 'panel'
 export interface ProfileRecord {
+  /** Local capability-mode epoch; persisted with flags so failed registry writes cannot admit ABA. */
+  authorizationEpoch?: string
   name: string
+  /** Person-facing label only; name remains the immutable storage/tool key. */
+  displayName?: string
+  deleting?: boolean
   enabled: boolean
   allowExtensions: boolean
   allowSettings: boolean
@@ -29,7 +36,14 @@ export interface ProfileRecord {
   createdBy: CreatedBy
   description: string
   temporary: boolean
+  /**
+   * The person's switch for the BroCrew helper. off: never loaded until they turn it on.
+   * turning-on: they pressed Turn on, which beats Chrome's older record of the switch until the
+   * helper is running again.
+   */
+  helper: HelperSwitch
 }
+export type HelperSwitch = 'on' | 'off' | 'turning-on'
 export const DESCRIPTION_MAX = 500
 // eslint-disable-next-line no-control-regex -- Refuse control characters in profile labels.
 const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/
@@ -42,7 +56,32 @@ export function checkDescription(value: unknown): string {
   return text
 }
 export class ProfileStoreError extends Error {}
+export const RENAME_ERRORS = {
+  invalid: 'Profile name must be 1–60 characters.',
+  duplicate: 'Another profile already uses that name.',
+  deleting: 'This profile is being deleted. Try again after deletion finishes.',
+} as const
+export function checkDisplayName(value: unknown): string {
+  if (typeof value !== 'string') throw new ProfileStoreError(RENAME_ERRORS.invalid)
+  const text = value.trim()
+  if ([...text].length < 1 || [...text].length > 60 || CONTROL.test(text))
+    throw new ProfileStoreError(RENAME_ERRORS.invalid)
+  return text
+}
+export const displayNameOf = (p: Pick<ProfileRecord, 'name' | 'displayName'>): string =>
+  p.displayName ?? p.name
+export function checkDisplayNameAvailable(
+  profiles: ProfileRecord[],
+  name: string,
+  label: string,
+): void {
+  if (
+    profiles.some((p) => p.name !== name && displayNameOf(p).toLowerCase() === label.toLowerCase())
+  )
+    throw new ProfileStoreError(RENAME_ERRORS.duplicate)
+}
 export interface ProfileStore {
+  shared?: SharedProfileAccess
   list(): ProfileRecord[]
   get(name: string): ProfileRecord | undefined
   dirOf(name: string): string
@@ -54,36 +93,58 @@ export interface ProfileStore {
       description?: string
     },
   ): ProfileRecord
+  rename(name: string, newName: string): ProfileRecord
   setDescription(name: string, description: string): ProfileRecord
   setFlags(name: string, flags: Partial<ProfileFlags>): ProfileRecord
+  setHelper(name: string, helper: HelperSwitch): ProfileRecord
   remove(name: string): void
 }
 export function isProfileName(value: unknown): value is string {
   return typeof value === 'string' && PROFILE_NAME.test(value)
 }
-export function createProfileStore(opts: { home: string; now?: () => Date }): ProfileStore {
+/**
+ * Sync and extensions are on by default, except in temporary profiles. Profiles made before that
+ * were switched on once, and profiles.json records it, so a person's later choice to turn either
+ * off is kept.
+ */
+export const DEFAULTS_VERSION = 2
+export function createProfileStore(opts: {
+  home: string
+  now?: () => Date
+  scopedAuthorization?: boolean
+}): ProfileStore {
   const now = opts.now ?? (() => new Date())
   const file = path.join(opts.home, 'profiles.json')
   const profilesDir = path.join(opts.home, 'profiles')
   privateFolder(opts.home, profilesDir, true)
   if (PRIVATE.dir !== undefined) fs.chmodSync(opts.home, PRIVATE.dir)
-  const read = (): ProfileRecord[] => {
+  const readFile = (): { defaults: number; profiles: ProfileRecord[] } => {
     let text: string
     try {
       text = fs.readFileSync(file, 'utf8')
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT')
+        return { defaults: DEFAULTS_VERSION, profiles: [] }
       throw new ProfileStoreError('profiles.json cannot be read')
     }
     try {
       const parsed = JSON.parse(text) as {
+        defaults?: unknown
         profiles?: unknown
       }
       if (!parsed || !Array.isArray(parsed.profiles)) throw new Error('shape')
-      return parsed.profiles
+      const defaults = Number.isSafeInteger(parsed.defaults) ? (parsed.defaults as number) : 1
+      const profiles: ProfileRecord[] = parsed.profiles
         .filter((p): p is ProfileRecord => isRecord(p) && isProfileName(p.name))
         .map((p) => ({
+          ...(typeof p.authorizationEpoch === 'string'
+            ? { authorizationEpoch: p.authorizationEpoch }
+            : {}),
           name: p.name,
+          ...(typeof p.displayName === 'string'
+            ? { displayName: checkDisplayName(p.displayName) }
+            : {}),
+          ...(p.deleting === true ? { deleting: true } : {}),
           enabled: p.enabled === true,
           allowExtensions: p.allowExtensions === true,
           allowSettings: p.allowSettings === true,
@@ -94,15 +155,36 @@ export function createProfileStore(opts: { home: string; now?: () => Date }): Pr
           description:
             typeof p.description === 'string' ? p.description.slice(0, DESCRIPTION_MAX) : '',
           temporary: p.temporary === true,
+          helper: p.helper === 'off' || p.helper === 'turning-on' ? p.helper : 'on',
         }))
+      return { defaults, profiles }
     } catch {
       throw new ProfileStoreError('profiles.json is not valid')
     }
   }
+  const read = (): ProfileRecord[] => readFile().profiles
   const write = (profiles: ProfileRecord[]): void => {
     const tmp = path.join(opts.home, `.profiles.${process.pid}.${Date.now()}.tmp`)
-    fs.writeFileSync(tmp, JSON.stringify({ profiles }, null, 2) + '\n', { mode: PRIVATE.file })
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ defaults: DEFAULTS_VERSION, profiles }, null, 2) + '\n',
+      {
+        mode: PRIVATE.file,
+      },
+    )
     fs.renameSync(tmp, file)
+  }
+  try {
+    const stored = readFile()
+    if (stored.defaults < DEFAULTS_VERSION)
+      write(
+        stored.profiles.map((p) =>
+          p.temporary ? p : { ...p, allowExtensions: true, allowSync: true },
+        ),
+      )
+  } catch (error) {
+    // An unreadable file is reported by the calls that read it, as before.
+    if (!(error instanceof ProfileStoreError)) throw error
   }
   const must = (
     name: string,
@@ -136,14 +218,15 @@ export function createProfileStore(opts: { home: string; now?: () => Date }): Pr
       const record: ProfileRecord = {
         name,
         enabled: temporary,
-        allowExtensions: false,
+        allowExtensions: !temporary,
         allowSettings: false,
-        allowSync: false,
+        allowSync: !temporary,
         keepRunning: false,
         createdAt: now().toISOString(),
         createdBy,
         description,
         temporary,
+        helper: 'on',
       }
       privateFolder(profilesDir, dir, true)
       write([...all, record])
@@ -151,9 +234,27 @@ export function createProfileStore(opts: { home: string; now?: () => Date }): Pr
     },
     setFlags(name, flags) {
       const { all, index } = must(name)
-      const next = { ...all[index] }
+      const next = {
+        ...all[index],
+        ...(opts.scopedAuthorization ? { authorizationEpoch: randomUUID() } : {}),
+      }
       for (const f of FLAG_NAMES) if (typeof flags[f] === 'boolean') next[f] = flags[f] as boolean
       all[index] = next
+      write(all)
+      return all[index]
+    },
+    setHelper(name, helper) {
+      const { all, index } = must(name)
+      all[index] = { ...all[index], helper }
+      write(all)
+      return all[index]
+    },
+    rename(name, newName) {
+      const text = checkDisplayName(newName)
+      const { all, index } = must(name)
+      if (all[index].deleting) throw new ProfileStoreError(RENAME_ERRORS.deleting)
+      checkDisplayNameAvailable(all, name, text)
+      all[index] = { ...all[index], displayName: text }
       write(all)
       return all[index]
     },
@@ -168,6 +269,8 @@ export function createProfileStore(opts: { home: string; now?: () => Date }): Pr
       const { all, index } = must(name)
       const dir = dirOf(name)
       // Keep the name reserved if disk removal fails, so old sign-ins cannot be reused.
+      all[index] = { ...all[index], deleting: true }
+      write(all)
       fs.rmSync(dir, { recursive: true, force: true })
       all.splice(index, 1)
       write(all)

@@ -1,3 +1,4 @@
+import type { PluginToolFailureReason } from './tool-diagnostics'
 export type BrokerValue =
   | null
   | boolean
@@ -81,6 +82,7 @@ export interface BrokerAudit {
   readonly operation: 'tool' | 'admin'
   readonly queued: number
   readonly code?: BrokerFailure
+  readonly reason?: PluginToolFailureReason
 }
 export interface BrokerOptions {
   readonly binding: BrokerBinding
@@ -94,6 +96,8 @@ export interface BrokerOptions {
   readonly resources: readonly BrokerResource[]
   readonly isAllowed: (identity: BrokerIdentity, use: ResourceUse) => boolean
   readonly server: BrokerServer
+  /** Trusted owner proof for the exact retained host and its descendants, never plugin input. */
+  readonly hostExited?: Promise<void>
   readonly clock?: BrokerClock
   readonly audit?: (event: BrokerAudit) => void
 }
@@ -135,6 +139,8 @@ export interface PluginToolBroker {
     revoke(capability: BrokerAgent | BrokerPerson): void
     detach(workspace: BrokerWorkspace): void
     invalidate(): void
+    /** Positive completion of every dispatched call; a failed/absent proof never grants this. */
+    hasCompletionProof(): boolean
   }
   status(): Readonly<{
     available: boolean

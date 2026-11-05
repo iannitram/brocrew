@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
-import { providerDescriptor } from '@brobot2/shared'
+import { PROVIDER_DESCRIPTORS, type ProviderDescriptor } from '@brobot2/shared'
 import { PROVIDER_PARTS, type ProviderPart } from '../lib/provider-parts'
 import type {
   CapabilityStatus,
@@ -9,6 +9,7 @@ import type {
   ProviderResources,
   ProviderUsageReading,
   ProviderVersion,
+  ProviderHomesReprovision,
 } from '../../../shared/runtime-ipc'
 import {
   A_STANDING_IN_A_WORD,
@@ -16,7 +17,11 @@ import {
   DEFAULT_PROFILE_ID,
   PROVIDER_NAME,
 } from '../../../shared/runtime-ipc'
-import type { ProviderCondition } from '../../../shared/provider-limit'
+import {
+  providerConditions,
+  wallsFromUsage,
+  type ProviderCondition,
+} from '../../../shared/provider-limit'
 import {
   limitsDisplayLabel,
   limitsDisplayWords,
@@ -51,6 +56,7 @@ import { modelsAfterConnection } from '../lib/models-after-connection'
 import { useProviderSetup } from '../composables/useProviderSetup'
 import ProviderInstall from './ProviderInstall.vue'
 import ProviderSetupProgress from './ProviderSetupProgress.vue'
+import ProviderConnections from './ProviderConnections.vue'
 
 /**
  * # W4.10 · one provider on the Providers screen
@@ -73,6 +79,7 @@ const props = withDefaults(
     frameless?: boolean
     displayName?: string
     provider: Provider
+    descriptor?: ProviderDescriptor
     capabilities: ProviderCapabilityMap | null
     /** This provider's usage warning, or `null` when it has sent none. */
     limit: ProviderCondition | null
@@ -199,7 +206,7 @@ async function aPersonChecksAgain(publishChange = true): Promise<void> {
   const provider = props.provider
   const probe =
     publishChange &&
-    providerDescriptor(provider).signIn.manualProbe &&
+    descriptor.value?.signIn.manualProbe === true &&
     !(auth.value?.state === 'usable' && auth.value.login === 'api-key')
   if (probe) noticeSays(null, false)
   if (props.readVersions === undefined) {
@@ -269,6 +276,67 @@ async function cancelSignIn(): Promise<void> {
     await window.api.runtime.cancelProviderSignIn(asked())
   } catch (error) {
     noticeSays(readableError(error), true)
+  }
+}
+
+const copyingHomes = ref(false)
+const copiedHomes = ref<ProviderHomesReprovision | null>(null)
+const copyHomesError = ref<string | null>(null)
+let copyHomesTimer: ReturnType<typeof setTimeout> | undefined
+const descriptor = computed(
+  () => props.descriptor ?? PROVIDER_DESCRIPTORS.find((item) => item.id === props.provider),
+)
+const keepsProfileSignIns = computed(() => descriptor.value?.credential === 'profile-or-key')
+async function readHomeCopies(statusOnly = false): Promise<void> {
+  const result = await window.api.runtime.reprovisionProviderHomes({
+    provider: props.provider,
+    ...(statusOnly ? { statusOnly: true } : {}),
+  })
+  if (!cardOpen) return
+  copiedHomes.value = result.profiles.length === 0 ? null : result
+  if (result.pending > 0)
+    copyHomesTimer = setTimeout(() => {
+      void readHomeCopies(true).catch(() => {
+        copyHomesError.value = 'Could not read the switch progress. Open Providers again to check.'
+      })
+    }, 1000)
+}
+async function copyAllMachineSignIns(): Promise<void> {
+  if (copyingHomes.value || (copiedHomes.value?.pending ?? 0) > 0) return
+  copyingHomes.value = true
+  copiedHomes.value = null
+  copyHomesError.value = null
+  clearTimeout(copyHomesTimer)
+  try {
+    await readHomeCopies()
+  } catch {
+    copyHomesError.value = 'Could not copy the sign-ins. Try again.'
+  } finally {
+    copyingHomes.value = false
+  }
+}
+function copyHomeReason(
+  reason:
+    | 'api-key'
+    | 'key-status-unavailable'
+    | 'unchanged'
+    | 'copy-failed'
+    | 'restart-failed'
+    | 'stop-failed',
+): string {
+  switch (reason) {
+    case 'api-key':
+      return 'Saved API key: all agents using this provider keep their key.'
+    case 'key-status-unavailable':
+      return 'API key status could not be checked. Try again.'
+    case 'unchanged':
+      return 'Already uses this Mac’s sign-in.'
+    case 'copy-failed':
+      return 'Could not copy the sign-in. Check this Mac’s sign-in and try again.'
+    case 'restart-failed':
+      return 'Sign-in copied, but this agent could not restart. Try again.'
+    case 'stop-failed':
+      return 'Could not confirm this agent stopped. Its sign-in was left unchanged.'
   }
 }
 
@@ -503,6 +571,7 @@ watch(
 )
 onBeforeUnmount(() => {
   cardOpen = false
+  clearTimeout(copyHomesTimer)
   modelRefresh?.abort()
 })
 
@@ -591,6 +660,23 @@ const usage = computed<{ text: string; title: string | null; tone: 'note' | 'war
   if (props.limitsDisplay !== undefined) {
     const display = props.limitsDisplay
     const reading = display.reading
+    // A retained warning can outlive its usage reading or account. The card's current
+    // readings supply near-limit figures; reported stops retain their separate evidence.
+    if (props.limit?.standing === 'about-to-stop') {
+      const near = wallsFromUsage(
+        { [props.provider]: (props.readings ?? []).filter((one) => one.unconfirmed !== true) },
+        [],
+        props.clock,
+      ).flatMap((wall) => providerConditions([wall], props.clock))
+      return {
+        text:
+          near.length === 0
+            ? warningHistoryLabel(display)
+            : near.map((one) => usageSays(one, props.clock)).join(' '),
+        title: near.length === 0 ? null : near.map(usageTitle).join('\n'),
+        tone: near.length === 0 ? 'note' : 'warn',
+      }
+    }
     return {
       text:
         props.limit !== null && reading !== null
@@ -826,6 +912,7 @@ onMounted(() => {
     void check()
     void readKey()
   }
+  if (keepsProfileSignIns.value) void readHomeCopies(true).catch(() => {})
   if (!programMissing.value) void lists.value.read(props.provider, undefined, { once: true })
 })
 watch(programMissing, (missing) => {
@@ -977,6 +1064,14 @@ defineExpose({ beginSetup })
           Set up {{ name }}
         </button>
       </div>
+      <ProviderConnections
+        :provider="props.provider"
+        :name="name"
+        :auth="auth"
+        :key-status="keyStatus"
+        :login-moved="props.loginMoved"
+        :models-known="!programMissing && list !== null && list.notAsked === null"
+      />
     </div>
 
     <section
@@ -1232,6 +1327,44 @@ defineExpose({ beginSetup })
         >
           {{ authNotice }}
         </p>
+        <div v-if="keepsProfileSignIns" data-cy="copy-all-sign-ins">
+          <p class="line quiet">
+            Copies this Mac’s sign-in for every agent in this install; saved API keys stay as they
+            are.
+          </p>
+          <button
+            type="button"
+            class="action"
+            :disabled="copyingHomes || setupBusy || (copiedHomes?.pending ?? 0) > 0"
+            @click="copyAllMachineSignIns"
+          >
+            {{
+              copyingHomes ? 'Copying sign-ins…' : `Use this Mac's ${name} sign-in for all agents`
+            }}
+          </button>
+          <div v-if="copiedHomes" role="status">
+            <p class="line quiet">
+              Agents restart automatically between tasks to use the new sign-in. BroCrew does not
+              need restarting.
+            </p>
+            <p class="line">
+              {{ copiedHomes.replaced }} switched now, {{ copiedHomes.pending }} will switch when
+              they finish their current task. {{ copiedHomes.skipped }} skipped /
+              {{ copiedHomes.failed }} failed.
+            </p>
+            <p
+              v-for="profile in copiedHomes.profiles.filter(
+                (one) => one.state === 'skipped' || one.state === 'failed',
+              )"
+              :key="profile.profileId"
+              class="line quiet"
+            >
+              {{ profile.profileId }}:
+              {{ 'reason' in profile ? copyHomeReason(profile.reason) : '' }}
+            </p>
+          </div>
+          <p v-if="copyHomesError" role="alert" class="line">{{ copyHomesError }}</p>
+        </div>
         <p v-if="renewalSends !== null" class="line quiet" data-cy="provider-login-renewal">
           {{ renewalSends }}
         </p>

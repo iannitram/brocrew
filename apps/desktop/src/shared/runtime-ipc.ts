@@ -161,7 +161,7 @@ import {
   providerDescriptor,
   providerRecord,
 } from '@brobot2/shared/providers'
-import type { Provider, SessionStatus, TurnEnding } from '@brobot2/shared'
+import type { Provider, ProviderConnection, SessionStatus, TurnEnding } from '@brobot2/shared'
 import type { AgentState } from './agent-state'
 // ⚑ **The capability schema, which is a `src/shared` module and holds no zod** (355) — the same
 // rule this file is written under, so the renderer may name a capability without paying for a
@@ -8508,6 +8508,7 @@ export type RuntimeCommand =
   | ({ kind: 'earlierHistory' } & EarlierHistoryInput)
   | ({ kind: 'latestHistory' } & SessionInput)
   | { kind: 'capabilities' }
+  | { kind: 'providerConnections' }
   /**
    * 🔴 **D-042 · R3 — the one list a person picks from**, for one provider and one agent
    * ({@link ModelList}). ⚑ `profileId` absent is BroBot's own.
@@ -8557,6 +8558,7 @@ export type RuntimeCommand =
   // provider home and "is Codex signed in?" therefore has one answer per profile, not one answer.
   | ({ kind: 'checkProviderAuth' } & CheckProviderAuthInput)
   | ({ kind: 'reprovisionProviderAuth' } & ProviderProfileInput)
+  | { kind: 'reprovisionProviderHomes'; provider: Provider; statusOnly?: boolean }
   | ({ kind: 'signInProvider' } & ProviderProfileInput)
   | ({ kind: 'cancelProviderSignIn' } & ProviderProfileInput)
   /**
@@ -9241,6 +9243,7 @@ export interface RuntimeCommandResults {
   latestHistory: HistoryWindow
   /** What each provider can do, as the adapters declare it (039). */
   capabilities: ProviderCapabilityMap
+  providerConnections: readonly ProviderConnection[]
   /**
    * Every profile that exists, {@link DEFAULT_PROFILE_ID} first (167).
    *
@@ -9427,6 +9430,7 @@ export interface RuntimeCommandResults {
   checkProviderAuth: AuthState
   /** Whether the re-copy actually changed anything — `unchanged` when the bytes already matched. */
   reprovisionProviderAuth: ReprovisionOutcome
+  reprovisionProviderHomes: ProviderHomesReprovision
   /** How the sign-in ended, INCLUDING what the credential looks like afterwards. */
   signInProvider: ProviderSignInResult
   /** Nothing — cancelling is an acknowledgement, and cancelling nothing is still success. */
@@ -9458,6 +9462,27 @@ export type ProviderCapabilityMap = Record<Provider, ProviderCapabilities>
 export interface CheckProviderAuthInput extends ProviderProfileInput {
   /** Explicit user gesture only; passive refreshes must omit this. */
   probe?: boolean
+}
+
+/** The result of a person's request to replace this install's profile sign-ins. */
+export interface ProviderHomesReprovision {
+  readonly replaced: number
+  readonly pending: number
+  readonly skipped: number
+  readonly failed: number
+  readonly profiles: readonly (
+    | { readonly profileId: string; readonly state: 'replaced' | 'pending' }
+    | {
+        readonly profileId: string
+        readonly state: 'skipped'
+        readonly reason: 'api-key' | 'key-status-unavailable' | 'unchanged'
+      }
+    | {
+        readonly profileId: string
+        readonly state: 'failed'
+        readonly reason: 'copy-failed' | 'restart-failed' | 'stop-failed'
+      }
+  )[]
 }
 
 export interface ProviderProfileInput {
@@ -10049,6 +10074,8 @@ export interface RuntimeBridge {
    * this map indexed by its provider. Never branch on the provider instead of asking.
    */
   capabilities(): Promise<ProviderCapabilityMap>
+  /** Existing connection metadata only; no credential, home preparation or provider probe. */
+  providerConnections(): Promise<readonly ProviderConnection[]>
   /**
    * 🔴 **D-042 · R3 — the one list a person picks from** ({@link ModelList}): one provider's rows and
    * the person's own, the last pick, and what a new conversation starts on.
@@ -10346,6 +10373,11 @@ export interface RuntimeBridge {
    * side breaks the other again. {@link RuntimeBridge.signInProvider} is the one that ends it.
    */
   reprovisionProviderAuth(input: ProviderProfileInput): Promise<ReprovisionOutcome>
+  /** Re-copy this install’s profile homes, preserving keys and running tasks; reopen idle sessions. */
+  reprovisionProviderHomes(input: {
+    provider: Provider
+    statusOnly?: boolean
+  }): Promise<ProviderHomesReprovision>
   /**
    * Sign this profile into its own account. **Resolves when the browser flow settles**, which may
    * be minutes — render a Cancel beside it and call {@link RuntimeBridge.cancelProviderSignIn}.

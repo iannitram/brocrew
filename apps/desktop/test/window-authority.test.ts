@@ -348,9 +348,11 @@ const CLASSIFIED: Record<
   // question: `requireAPerson`, whose census is with the rails.
   setDefaultApprovalMode: 'no session',
   capabilities: 'no session',
+  providerConnections: 'no session',
   profiles: 'no session',
   checkProviderAuth: 'no session',
   reprovisionProviderAuth: 'no session',
+  reprovisionProviderHomes: 'no session',
   signInProvider: 'no session',
   cancelProviderSignIn: 'no session',
 

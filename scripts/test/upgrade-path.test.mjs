@@ -433,6 +433,107 @@ describe('the rows the beta left', () => {
   })
 })
 
+describe('connection columns added by a candidate upgrade', () => {
+  const defaults = {
+    agent_identity: { connection_id: null },
+    provider_session: { connection_id: null },
+  }
+  const before = {
+    agent_identity: [{ id: 'aid:fern', slug: 'fern', model_choice: 'fictional model' }],
+    provider_session: [
+      { id: 'fictional-thread', external_ref: 'original-thread', cwd: '/fictional/original' },
+    ],
+    provider_api_key: [{ provider: 'codex', sealed: 'fictional-sealed-reference' }],
+    events: [{ id: 'fictional-event', payload: 'Fictional history' }],
+  }
+  const keys = {
+    agent_identity: ['id'],
+    provider_session: ['id'],
+    provider_api_key: ['provider'],
+    events: ['id'],
+  }
+  const migrated = () => ({
+    ...copy(before),
+    agent_identity: before.agent_identity.map((row) => ({ ...row, connection_id: null })),
+    provider_session: before.provider_session.map((row) => ({ ...row, connection_id: null })),
+  })
+  const compare = (after, original = before, mayMove) =>
+    rowsPreserved(original, after, mayMove, keys, undefined, defaults)
+
+  it('accepts only the declared null additions while retaining every original field', () => {
+    expect(compare(migrated())).toEqual({ lost: [], added: {} })
+  })
+
+  it.each(['agent_identity', 'provider_session'])(
+    'requires the new column to exist on migrated %s rows',
+    (table) => {
+      const after = migrated()
+      delete after[table][0].connection_id
+      expect(compare(after).lost).toEqual([
+        { table, row: JSON.stringify([before[table][0].id]), changed: ['connection_id'] },
+      ])
+    },
+  )
+
+  for (const table of ['agent_identity', 'provider_session']) {
+    it.each([undefined, '', 'fictional-connection', 0, false])(
+      `rejects an undeclared new ${table} binding %s`,
+      (value) => {
+        const after = migrated()
+        after[table][0].connection_id = value
+        expect(compare(after).lost).toEqual([
+          { table, row: JSON.stringify([before[table][0].id]), changed: ['connection_id'] },
+        ])
+      },
+    )
+  }
+
+  it('keeps a previously recorded binding exact instead of resetting it to the migration default', () => {
+    const original = migrated()
+    original.provider_session[0].connection_id = 'codex:api-key'
+    expect(compare(copy(original), original).lost).toEqual([])
+    const changed = copy(original)
+    changed.provider_session[0].connection_id = null
+    expect(compare(changed, original).lost).toEqual([
+      { table: 'provider_session', row: '["fictional-thread"]', changed: ['connection_id'] },
+    ])
+  })
+
+  it('does not ignore new bindings even when a caller names them as movable', () => {
+    const after = migrated()
+    after.provider_session[0].connection_id = 'fictional-connection'
+    expect(compare(after, before, { provider_session: ['connection_id'] }).lost).toHaveLength(1)
+  })
+
+  it.each([
+    ['agent_identity', 'model_choice'],
+    ['provider_session', 'external_ref'],
+    ['provider_session', 'cwd'],
+    ['provider_api_key', 'sealed'],
+    ['events', 'payload'],
+  ])('still refuses a changed original %s.%s', (table, column) => {
+    const after = migrated()
+    after[table][0][column] = 'fictional rewritten value'
+    expect(compare(after).lost).toEqual([
+      {
+        table,
+        row: JSON.stringify(keys[table].map((key) => before[table][0][key])),
+        changed: [column],
+      },
+    ])
+  })
+
+  it('does not permit unrelated new fields or change the recovery-copy comparison', () => {
+    const after = migrated()
+    after.agent_identity[0].unexpected = null
+    expect(compare(after).lost).toEqual([
+      { table: 'agent_identity', row: '["aid:fern"]', changed: ['unexpected'] },
+    ])
+    expect(rowsPreserved(before, migrated(), {}, keys).lost).toHaveLength(2)
+    expect(rowsPreserved(before, copy(before), {}, keys).lost).toEqual([])
+  })
+})
+
 describe('standing-rule history gains an unknown author during an upgrade', () => {
   const legacy = { id: 'rules-lark-1', text: 'Keep reviews short', wrote_it: 'a-person' }
   const keys = { identity_instruction: ['id'] }
@@ -2339,6 +2440,37 @@ describe('skill catalogue upgrade evidence', () => {
         after.skill_catalogue_state[0].revision++
       }
       expect(skillsKept(before, after).length).toBeGreaterThan(0)
+    },
+  )
+})
+
+describe('plugin owner quiescence across a packaged upgrade quit', () => {
+  it('distinguishes no plugin flow from a proven stopped owner', () => {
+    expect(upgradeRules.pluginOwnerQuiescence(null)).toBe('not-exercised')
+    expect(
+      upgradeRules.pluginOwnerQuiescence({
+        version: 1,
+        epoch: '11111111-1111-4111-8111-111111111111',
+        phase: 'stopped',
+      }),
+    ).toBe('stopped')
+  })
+  it.each(['accepting', 'draining', 'blocked', 'unknown'])(
+    'does not accept a %s owner just because the app exited',
+    (phase) => {
+      expect(
+        upgradeRules.pluginOwnerQuiescence({
+          version: 1,
+          epoch: '11111111-1111-4111-8111-111111111111',
+          phase,
+        }),
+      ).toBe('not-stopped')
+    },
+  )
+  it.each([undefined, {}, { phase: 'stopped' }, { version: 1, epoch: 'bad', phase: 'stopped' }])(
+    'fails closed on malformed owner evidence %j',
+    (record) => {
+      expect(upgradeRules.pluginOwnerQuiescence(record)).toBe('not-stopped')
     },
   )
 })

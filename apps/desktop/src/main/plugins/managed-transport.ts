@@ -1,3 +1,4 @@
+import { reportPluginToolFailure, type PluginToolDiagnostic } from './tool-diagnostics'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -72,7 +73,10 @@ export function createPrivatePluginPort(options: {
   url: string
   credential: string
   privateCredentials?: readonly string[]
+  diagnostic?: PluginToolDiagnostic
 }): BrokerServer {
+  const report = (reason: Parameters<PluginToolDiagnostic>[0]) =>
+    reportPluginToolFailure(options.diagnostic, reason)
   const url = endpoint(options.url)
   const credential = options.credential
   const privateCredentials = [credential, ...(options.privateCredentials ?? [])]
@@ -84,7 +88,8 @@ export function createPrivatePluginPort(options: {
   return {
     tool(request, signal) {
       let client: Client | undefined,
-        cancelled = false
+        cancelled = false,
+        closingAfterReply = false
       let prove!: () => void, unproved!: () => void
       const quiescent = new Promise<void>((resolve, reject) => {
         prove = resolve
@@ -93,14 +98,51 @@ export function createPrivatePluginPort(options: {
       void quiescent.catch(() => undefined)
       const cancel = () => {
         cancelled = true
-        void client?.close().catch(() => undefined)
+        report('cancelled')
+        void client?.close().catch(() => report('transport-close-failed'))
+      }
+      const reportError = (error: unknown, phase: Parameters<PluginToolDiagnostic>[0]) => {
+        report(phase)
+        // Transport exceptions may contain page data. Only these closed causes may be retained.
+        try {
+          const value = error as {
+            name?: unknown
+            code?: unknown
+            cause?: { code?: unknown }
+          } | null
+          const code = value?.cause?.code ?? value?.code
+          if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET')
+            report('transport-connection-reset')
+          else if (code === 'ECONNREFUSED') report('transport-connection-refused')
+          else if (
+            code === 'ETIMEDOUT' ||
+            code === 'UND_ERR_CONNECT_TIMEOUT' ||
+            code === -32001 ||
+            value?.name === 'TimeoutError'
+          )
+            report('transport-timeout')
+          else if (value?.name === 'AbortError') report('transport-aborted')
+          else if (code === 401 || code === 403) report('transport-auth-refused')
+        } catch {
+          /* Never inspect or stringify an arbitrary error further. */
+        }
       }
       const result = (async (): Promise<BrokerReply> => {
         let natural = false
+        let connected = false
         try {
-          if (signal.aborted) return { ok: false }
+          if (signal.aborted) {
+            report('cancelled')
+            return { ok: false }
+          }
           client = new Client({ name: 'brocrew-plugin-broker', version: '1' })
-          client.onerror = () => undefined
+          client.onerror = (error) => {
+            // Closing a completed per-call client aborts its idle SSE reader. That
+            // local teardown callback is not a failed tool call. Catch still reports
+            // call failures; close() rejection below retains its separate diagnostic.
+            if (!closingAfterReply)
+              reportError(error, connected ? 'transport-call-failed' : 'transport-connect-failed')
+          }
           signal.addEventListener('abort', cancel, { once: true })
           const transport = new StreamableHTTPClientTransport(url, {
             requestInit: { headers: { Authorization: `Bearer ${credential}` }, redirect: 'error' },
@@ -112,7 +154,10 @@ export function createPrivatePluginPort(options: {
                 new TransformStream<Uint8Array, Uint8Array>({
                   transform(chunk, controller) {
                     bytes += chunk.byteLength
-                    if (bytes > OUTPUT_BYTES) throw new Error(WORDS)
+                    if (bytes > OUTPUT_BYTES) {
+                      report('response-limit')
+                      throw new Error(WORDS)
+                    }
                     controller.enqueue(chunk)
                   },
                 }),
@@ -121,27 +166,46 @@ export function createPrivatePluginPort(options: {
             },
           })
           await client.connect(transport)
+          connected = true
           const reply = await client.callTool({ name: request.name, arguments: request.input })
           natural = true
-          if (
-            cancelled ||
-            signal.aborted ||
-            privateCredentials.some((one) => containsCredential(reply, one))
-          )
+          if (cancelled || signal.aborted) {
+            report('cancelled')
             return { ok: false }
+          }
+          if (privateCredentials.some((one) => containsCredential(reply, one))) {
+            report('credential-in-result')
+            return { ok: false }
+          }
           const checked = CallToolResultSchema.safeParse(reply)
-          if (!checked.success || checked.data.isError) return { ok: false }
+          if (!checked.success) {
+            report('result-invalid')
+            return { ok: false }
+          }
+          if (checked.data.isError) {
+            report('tool-error')
+            return { ok: false }
+          }
           return { ok: true, value: checked.data as BrokerValue }
-        } catch {
+        } catch (error) {
+          reportError(
+            error,
+            cancelled || signal.aborted
+              ? 'cancelled'
+              : connected
+                ? 'transport-call-failed'
+                : 'transport-connect-failed',
+          )
           return { ok: false }
         } finally {
           signal.removeEventListener('abort', cancel)
           let closed = false
+          closingAfterReply = natural && !cancelled && !signal.aborted
           try {
             await client?.close()
             closed = true
           } catch {
-            /* No raw transport error crosses the boundary. */
+            report('transport-close-failed')
           }
           if (natural && closed && !cancelled) prove()
           else unproved()
@@ -164,26 +228,32 @@ export async function openManagedPluginRoute(
   broker: PluginToolBroker,
   agent: BrokerAgent,
   current: () => boolean = () => true,
+  diagnostic?: PluginToolDiagnostic,
 ): Promise<ManagedPluginRoute> {
+  const report = (reason: Parameters<PluginToolDiagnostic>[0]) =>
+    reportPluginToolFailure(diagnostic, reason)
   const offered = broker.agent.discover(agent)
   const name = offered[0]?.namespace
   if (!name || offered.some((tool) => tool.namespace !== name)) throw new Error(WORDS)
   const capability = randomBytes(32).toString('hex')
   const expected = Buffer.from(`Bearer ${capability}`)
   let accepting = true
+  let closing: Promise<void> | undefined
   const exchanges = new Set<StreamableHTTPServerTransport>()
   const active = new Map<string | number, AbortController>()
+  const responses = new Set<Promise<void>>()
   const http = createServer(
     { maxHeaderSize: 8192, requestTimeout: 15_000, headersTimeout: 10_000 },
     (req, res) => {
       void (async () => {
         const supplied = Buffer.from(req.headers.authorization ?? '')
-        if (
-          !accepting ||
-          !current() ||
-          supplied.length !== expected.length ||
-          !timingSafeEqual(supplied, expected)
-        ) {
+        if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+          res.writeHead(401)
+          res.end()
+          return
+        }
+        if (!accepting || !current()) {
+          report('route-stale')
           res.writeHead(401)
           res.end()
           return
@@ -205,10 +275,22 @@ export async function openManagedPluginRoute(
         try {
           broker.agent.discover(agent)
         } catch {
+          report('route-unavailable')
           res.writeHead(401)
           res.end()
           return
         }
+        const flushed: Promise<void> = new Promise<void>((resolve) => {
+          const done = () => {
+            res.off('finish', done)
+            res.off('close', done)
+            responses.delete(flushed)
+            resolve()
+          }
+          res.once('finish', done)
+          res.once('close', done)
+        })
+        responses.add(flushed)
         const chunks: Buffer[] = []
         let length = 0
         for await (const chunk of req) {
@@ -269,9 +351,15 @@ export async function openManagedPluginRoute(
           })),
         }))
         mcp.setRequestHandler(CallToolRequestSchema, async (call) => {
-          if (!current()) return textReply()
+          if (!current()) {
+            report('route-stale')
+            return textReply()
+          }
           const tool = offered.find((one) => one.name === call.params.name)
-          if (!tool) return textReply()
+          if (!tool) {
+            report('route-tool-unknown')
+            return textReply()
+          }
           try {
             const result = await broker.agent.call(
               agent,
@@ -280,8 +368,10 @@ export async function openManagedPluginRoute(
               controller.signal,
             )
             const parsed = CallToolResultSchema.safeParse(result)
+            if (!parsed.success) report('result-invalid')
             return parsed.success ? parsed.data : textReply()
           } catch {
+            // The broker audit records its own closed failure code.
             return textReply()
           }
         })
@@ -293,7 +383,10 @@ export async function openManagedPluginRoute(
         })
         await mcp.connect(transport)
         await transport.handleRequest(req, res, body)
-      })().catch(() => fail(res))
+      })().catch(() => {
+        report('route-request-failed')
+        fail(res)
+      })
     },
   )
   await new Promise<void>((resolve, reject) => {
@@ -306,14 +399,31 @@ export async function openManagedPluginRoute(
       url: `http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`,
       capability,
     }),
-    async close() {
-      accepting = false
-      for (const controller of active.values()) controller.abort()
-      active.clear()
-      broker.owner.revoke(agent)
-      await Promise.allSettled([...exchanges].map((transport) => transport.close()))
-      http.closeAllConnections()
-      await new Promise<void>((resolve) => http.close(() => resolve()))
+    close() {
+      return (closing ??= (async () => {
+        accepting = false
+        const closed = new Promise<void>((resolve) => http.close(() => resolve()))
+        broker.owner.revoke(agent)
+        // Revocation answers the old caller immediately. Let that fixed failure
+        // reach its HTTP response before closing the MCP transport. This bounded
+        // local flush grants no remote completion or host-exit authority.
+        let grace: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            Promise.all([...responses]),
+            new Promise<void>((resolve) => {
+              grace = setTimeout(resolve, 500)
+            }),
+          ])
+        } finally {
+          clearTimeout(grace)
+        }
+        for (const controller of active.values()) controller.abort()
+        active.clear()
+        await Promise.allSettled([...exchanges].map((transport) => transport.close()))
+        http.closeAllConnections()
+        await closed
+      })())
     },
   }
 }

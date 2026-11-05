@@ -8,6 +8,7 @@ import { pluginWorkspaceIdentity } from './plugins/supervisor/client'
 import { registerPluginSettings } from './plugins/settings'
 import { productionPluginController } from './plugins/production'
 import { PluginSupervisorAttachment, pluginSupervisorRoot } from './plugins/supervisor/client'
+import { sharedDataOwner } from './plugins/shared-data'
 import { PLUGIN_SCHEME } from './plugins/ui/assets'
 import { installPluginUiRpc } from './plugins/ui/host'
 import { ipcMain } from './app-ipc'
@@ -15,6 +16,7 @@ import startStorageWorker from './storage.worker?nodeWorker'
 import { StorageService } from './storage/service'
 import { clearHttpCache, httpCacheFolder } from './storage/cache'
 import { registerStorageIpc } from './storage/ipc'
+import { StorageFailure } from './storage/engine'
 import { registerVoiceIpc } from './voice/ipc'
 import { VoiceService } from './voice/service'
 import { runVoiceHelper } from './voice/engine'
@@ -23,7 +25,6 @@ import { profileSkillAccess, SharedSkillDiscovery } from './skills/shared-discov
 import { convertSharedSkills } from './skills/shared-conversion'
 import { SharedSkillLibrary } from './skills/shared-library'
 import { providerProcessesAreInFlight } from './runtime/live-hosts'
-import { armRecoveryExpiry } from './recovery/retention-timer'
 import { RECOVERY_RETENTION_CHANNELS } from '../shared/recovery-retention'
 import {
   prune,
@@ -138,6 +139,7 @@ import {
   totalBytes,
 } from './process-tree'
 import { openDatabase, type AppDatabase } from './db/connection'
+import { listProviderConnections, resolveProviderConnection } from './db/provider-connections'
 import { newProviderSessionId } from './db/ids'
 import { discoverSessionsIn } from './adopt/discover-sessions'
 import {
@@ -164,7 +166,6 @@ import {
   createRecoveryService,
   createRecoveryServiceForTests,
   faultsFromSwitch,
-  pruneTheCopies,
   KEEP_RECOVERY_WINDOW_SWITCH,
   RECOVERY_FAULT_SWITCH,
   keepsTheRecoveryWindow,
@@ -422,31 +423,12 @@ let transcriptRetention: TranscriptRetentionHost | undefined
 let recoveryMaintenance: Promise<unknown> = Promise.resolve()
 let recoveryStartSucceeded = false
 let recoveryStartRecorded: Promise<void> | undefined
-let recoveryExpiryTimer: ReturnType<typeof setTimeout> | undefined
 function withRecoveryCopies<T>(work: () => Promise<T>): Promise<T> {
   const next = recoveryMaintenance.then(work)
   recoveryMaintenance = next.catch(() => undefined)
   return next
 }
 
-async function scheduleRecoveryExpiry(): Promise<void> {
-  clearTimeout(recoveryExpiryTimer)
-  recoveryExpiryTimer = undefined
-  const copy = await retainedCopyInfo(app.getPath('userData'), theBuildsMigrations(), {
-    ownership: theOneAppAnswer?.held() ?? 'unknown',
-    currentAppVersion: app.getVersion(),
-  })
-  if (!copy) return
-  recoveryExpiryTimer = armRecoveryExpiry(copy.expiresAt, () => {
-    void withRecoveryCopies(async () => {
-      await prune(app.getPath('userData'), theBuildsMigrations(), {
-        ownership: theOneAppAnswer?.held() ?? 'unknown',
-        currentAppVersion: app.getVersion(),
-      })
-      await scheduleRecoveryExpiry()
-    }).catch((error) => console.warn('BroCrew kept its recovery copy:', error))
-  })
-}
 let signalFirstWindowLoad!: () => void
 const firstWindowLoad = new Promise<void>((resolve) => {
   signalFirstWindowLoad = resolve
@@ -816,6 +798,11 @@ async function createRuntimeHost(database: AppDatabase): Promise<RuntimeHost> {
         status: (provider) => apiKeys.status(provider),
       },
     }),
+    (provider) => ({
+      list: () => listProviderConnections(database, provider),
+      resolve: (connectionId) => resolveProviderConnection(database, { provider, connectionId }),
+      revision: () => apiKeys.revision(provider),
+    }),
   )
   const providerAuth = providerAuthFromModules(providerModules)
   const runtimeHost = new RuntimeHost({
@@ -901,7 +888,16 @@ async function createRuntimeHost(database: AppDatabase): Promise<RuntimeHost> {
     },
     // Resolve the bundled Codex by absolute path, independent of PATH and the user's installed
     // version. Resolve per launch so a missing binary is reported on the command that needs it.
-    createRuntime: (provider) => providerModules[provider].createRuntime(),
+    createRuntime: (provider, connectionId) =>
+      providerModules[provider].createRuntime(connectionId),
+    connectionFor: (provider, connectionId) => {
+      const connections = providerModules[provider].connections
+      if (!connections) throw new Error('Provider connection services were not bound')
+      return connections.resolve(connectionId).id
+    },
+    connectionRevision: (provider) => apiKeys.revision(provider),
+    listConnections: () =>
+      Object.values(providerModules).flatMap((module) => module.connections?.list() ?? []),
     // Derive the profile from the session; keep its provider home under `HOME_FOLDER`.
     beforeProviderLaunch: async () => {
       await transcriptRetention?.beforeLaunch()
@@ -1381,6 +1377,10 @@ function registerIpc(runtimeHost: RuntimeHost, localZone: () => LocalZone | null
       backups: [backupsDir(storageData), recoveryDir(storageData)],
       recovery: recoveryDir(storageData),
       plugins: storagePlugins,
+      sharedPlugins:
+        !presentation.hidden && storagePlugins
+          ? join(app.getPath('appData'), '@brobot2', 'shared')
+          : null,
       cache: httpCacheFolder(session.defaultSession.storagePath),
       resources: resourcesRoot(storageData),
     },
@@ -1393,6 +1393,21 @@ function registerIpc(runtimeHost: RuntimeHost, localZone: () => LocalZone | null
   stopStorageIpc = registerStorageIpc(ipcMain, storage, {
     reveal: (path) => shell.showItemInFolder(path),
     clearCache: () => clearHttpCache(storage, () => session.defaultSession.clearCache()),
+    pruneBackups: () =>
+      withRecoveryCopies(async () => {
+        if (!recoveryStartSucceeded || theOneAppAnswer?.held() !== 'sole')
+          throw new StorageFailure('unavailable')
+        let failed = false
+        await prune(app.getPath('userData'), theBuildsMigrations(), {
+          ownership: 'sole',
+          currentAppVersion: app.getVersion(),
+          warn: (line) => {
+            failed = true
+            console.warn(line)
+          },
+        })
+        if (failed) throw new StorageFailure('unavailable')
+      }),
     isAppWindow: (event) =>
       storageAppWindows.has(event.sender) &&
       !event.sender.isDestroyed() &&
@@ -2144,14 +2159,10 @@ async function letGoOfOldCopies(): Promise<void> {
   return withRecoveryCopies(async () => {
     try {
       await recoveryStartRecorded
-      const removed = await pruneTheCopies(
-        app.getPath('userData'),
-        resolveMigrationsFolder(),
-        theOneAppAnswer?.held() ?? 'unknown',
-        (line) => console.warn(line),
-        app.getVersion(),
-      )
-      await scheduleRecoveryExpiry()
+      const removed = await prune(app.getPath('userData'), theBuildsMigrations(), {
+        ownership: theOneAppAnswer?.held() ?? 'unknown',
+        currentAppVersion: app.getVersion(),
+      })
       if (removed.length > 0) {
         console.info(`BroCrew let go of ${String(removed.length)} old recovery copies`)
       }
@@ -2509,6 +2520,18 @@ function start(ownership: HostGateVerdict): void {
               : undefined,
             root,
             workspaceRoot: app.getPath('userData'),
+            sharedDataOwner: sharedDataOwner({
+              appData: app.getPath('appData'),
+              root,
+              workspaceRoot: app.getPath('userData'),
+              hidden: presentation.hidden,
+              label: !presentation.hidden
+                ? await carefulWorkspaceName(
+                    app.getPath('userData'),
+                    samePath(app.getPath('userData'), defaultDataFolder(app.getPath('appData'))),
+                  ).catch(() => undefined)
+                : undefined,
+            }),
             resourcesRoot: app.isPackaged
               ? process.resourcesPath
               : join(__dirname, '../../resources'),

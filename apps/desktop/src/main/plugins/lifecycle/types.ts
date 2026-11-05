@@ -58,8 +58,12 @@ export interface LifecycleOptions {
   runtime: LifecycleRuntime
   /** Synchronous central broker/consumer admission revocation, before any await. */
   deny(pluginId: string): void
+  /** Owner-only wakeup. Receivers must still await the retained run's positive exit proof. */
+  onChromeHostExit?(runId: string): void
   download?: (release: Readonly<PluginRelease>, signal: AbortSignal) => Promise<Uint8Array>
   now?: () => number
+  /** Live host-broker reachability, separate from the plugin process lifecycle. */
+  toolsUnavailable?: (pluginId: string) => boolean
   /** Inert fault controls only; never a production launch option. */
   fault?: (
     point: 'prepared' | 'staged' | 'ready' | 'activated' | 'receipted' | 'update-fenced',

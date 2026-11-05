@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import os from 'node:os'
 import path from 'node:path'
-import type { Page } from 'playwright-core'
+import type { Page, Download } from 'playwright-core'
 import type { BrowserMode, ProfileBrowser } from '../src/browser/profileBrowser.js'
 import { ProfileInUseError } from '../src/browser/profileBrowser.js'
 import type { KeyedSerializer } from '../src/shared/browser/browser-lease.js'
@@ -65,12 +65,15 @@ export class FakeLocator {
   }
 }
 export class FakeDownload {
+  readonly _artifact: { _initializer: { absolutePath: string } }
   deleted = false
   constructor(
     private readonly name: string,
     private readonly content: Buffer,
     public file = '',
-  ) {}
+  ) {
+    this._artifact = { _initializer: { absolutePath: file } }
+  }
   suggestedFilename() {
     return this.name
   }
@@ -195,21 +198,33 @@ export class FakePage extends EventEmitter {
   }
   waitForEvent(
     event: string,
-    opts: {
-      timeout?: number
-    } = {},
+    opts: { timeout?: number; predicate?: (value: unknown) => boolean | Promise<boolean> } = {},
   ) {
     return new Promise((resolve, reject) => {
-      const timer = opts.timeout
-        ? setTimeout(
-            () => reject(Object.assign(new Error('timeout'), { name: 'TimeoutError' })),
-            opts.timeout,
-          )
-        : undefined
-      this.once(event, (v) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const cleanup = () => {
         if (timer) clearTimeout(timer)
-        resolve(v)
-      })
+        this.off(event, listener)
+      }
+      const listener = (value: unknown) => {
+        void Promise.resolve(opts.predicate?.(value) ?? true)
+          .then((accepted) => {
+            if (accepted) {
+              cleanup()
+              resolve(value)
+            }
+          })
+          .catch((error: unknown) => {
+            cleanup()
+            reject(error)
+          })
+      }
+      if (opts.timeout)
+        timer = setTimeout(() => {
+          cleanup()
+          reject(Object.assign(new Error('timeout'), { name: 'TimeoutError' }))
+        }, opts.timeout)
+      this.on(event, listener)
     })
   }
   cookieJar: Array<{
@@ -306,6 +321,14 @@ export class FakeBrowser implements ProfileBrowser {
     for (const cb of this.closedListeners.get(profile) ?? []) cb(cur.generation)
   }
   captures: string[] = []
+  async deletePrivateDownload(profile: string, download: Download): Promise<void> {
+    void profile
+    await download.delete()
+  }
+  async cancelPrivateDownload(profile: string, download: Download): Promise<void> {
+    void profile
+    await download.cancel()
+  }
   async captureDownloads<T>(profile: string, _page: Page, fn: () => Promise<T>): Promise<T> {
     this.captures.push(profile)
     return fn()
@@ -322,6 +345,12 @@ export class FakeBrowser implements ProfileBrowser {
     this.recentWindows.set(profile, await this.windowId(profile, page))
   }
   nativeWindows = new Map<string, number>()
+  helper: 'ready' | 'off' | 'unavailable' = 'ready'
+  helperTurnedOn: string[] = []
+  async turnHelperOn(profile: string): Promise<void> {
+    this.helperTurnedOn.push(profile)
+    this.helper = 'ready'
+  }
   async newPage(
     profile: string,
     opts: { newWindow: boolean; windowOf?: Page; onNote?: (note: string) => void } = {
@@ -330,18 +359,24 @@ export class FakeBrowser implements ProfileBrowser {
   ): Promise<Page> {
     if (!this.states.has(profile)) throw new Error('profile is not open')
     const p = new FakePage()
-    const chosen = opts.windowOf
-      ? await this.windowId(profile, opts.windowOf)
-      : (opts.newWindow && this.state(profile)?.mode === 'visible') ||
-          !this.nativeWindows.has(profile)
-        ? ++this.nextWindow
-        : this.nativeWindows.get(profile)!
-    if (opts.windowOf && this.nativeWindows.get(profile) !== chosen) {
+    const requested = opts.windowOf ? await this.windowId(profile, opts.windowOf) : undefined
+    const native = this.nativeWindows.get(profile)
+    // With the helper on, a requested window is exact; without it Chrome keeps its own choice.
+    const chosen =
+      requested !== undefined && (this.helper === 'ready' || native === undefined)
+        ? requested
+        : requested !== undefined
+          ? native!
+          : (opts.newWindow && this.state(profile)?.mode === 'visible') || native === undefined
+            ? ++this.nextWindow
+            : native
+    if (requested !== undefined && chosen !== requested)
       opts.onNote?.(
-        'Opening in the requested window used a fallback that may bring Chrome to the front.',
+        this.helper === 'off'
+          ? `Opened in window ${chosen}; the requested window was ${requested}. BroCrew helper is off for this Chrome profile, so Chrome chose the window. Ask the person to turn it on in Settings → Plugins → Chrome.`
+          : `Opened in window ${chosen}; the requested window was ${requested}. Chrome chose the window; placing it in another one could bring Chrome to the front.`,
       )
-      this.nativeWindows.set(profile, chosen)
-    } else if (
+    else if (
       !opts.newWindow &&
       !opts.windowOf &&
       this.recentWindows.has(profile) &&

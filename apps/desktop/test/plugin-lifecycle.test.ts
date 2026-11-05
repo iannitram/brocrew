@@ -865,3 +865,73 @@ describe('bounded plugin download (portable inert responses)', () => {
     })
   })
 })
+
+it.skipIf(process.platform === 'win32')(
+  'negotiates tool health through Settings without adding fields to older list replies',
+  async () => {
+    let unavailable = false
+    const f = await fixture({ toolsUnavailable: () => unavailable })
+    await f.controller.install(f.handle, 'chrome')
+    const key = 'b'.repeat(64)
+    const restartChrome = vi.fn(async () => {
+      unavailable = false
+    })
+    const service = await servePersonPluginControl({
+      root: f.root,
+      key,
+      controller: sharedLifecycleWorkspaces(f.controller),
+      read: async () => null,
+      restartChrome,
+    })
+    const client = await connectPluginSettings({
+      path: service.path,
+      personKey: key,
+      root: f.root,
+      pinnedPublicKey: f.opts.pinnedPublicKey,
+      target: f.opts.target,
+      catalogue: f.opts.catalogue,
+      projection: projection().sink,
+      propose() {},
+    })
+    const legacy = await connectPersonPluginControl({
+      path: service.path,
+      key,
+      handle: async () => true,
+    })
+    try {
+      await legacy.call({
+        kind: 'attach',
+        workspaceId: randomUUID(),
+        catalogueDigest: pluginSha256(f.opts.catalogue.bytes),
+      })
+      expect((await client.catalogue())[0]).not.toHaveProperty('toolsUnavailable')
+      expect((await client.catalogue())[0]).not.toHaveProperty('canRestart')
+      unavailable = true
+      expect((await client.catalogue())[0]).toMatchObject({
+        state: 'Running',
+        toolsUnavailable: true,
+        canRestart: true,
+      })
+      expect(
+        ((await legacy.call({ kind: 'list-v2' })) as Record<string, unknown>[])[0],
+      ).not.toHaveProperty('toolsUnavailable')
+      expect(
+        ((await legacy.call({ kind: 'list-v2' })) as Record<string, unknown>[])[0],
+      ).not.toHaveProperty('canRestart')
+      expect(Command.safeParse({ kind: 'restart-chrome' }).success).toBe(false)
+      expect(client.restartChrome).toBeTypeOf('function')
+      await client.restartChrome!()
+      expect(restartChrome).toHaveBeenCalledOnce()
+      expect(
+        ((await legacy.call({ kind: 'list' })) as Record<string, unknown>[])[0],
+      ).not.toHaveProperty('toolsUnavailable')
+      unavailable = false
+      expect((await client.catalogue())[0]).not.toHaveProperty('toolsUnavailable')
+    } finally {
+      await legacy.call({ kind: 'detach' })
+      legacy.close()
+      await client.close()
+      await service.close()
+    }
+  },
+)

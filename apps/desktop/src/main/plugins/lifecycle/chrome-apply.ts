@@ -11,17 +11,54 @@ export const ChromeLedgerProposal = z.discriminatedUnion('action', [
 ])
 export const ChromeProposal = z.union([
   ChromeLedgerProposal,
+  z.strictObject({ action: z.literal('rename-profile'), profile, newName: z.string().max(4096) }),
   z
-    .strictObject({ action: z.literal('delete-profile'), profile, confirm: profile })
+    .strictObject({
+      action: z.literal('delete-profile'),
+      profile,
+      confirm: profile,
+      deleteConfirmation: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/)
+        .optional(),
+    })
     .refine((input) => input.confirm === input.profile),
+  z.strictObject({ action: z.literal('helper-on'), profile }),
+  z
+    .strictObject({
+      action: z.literal('set-flags'),
+      profile,
+      allowSync: z.boolean().optional(),
+      allowExtensions: z.boolean().optional(),
+      allowSettings: z.boolean().optional(),
+      keepRunning: z.boolean().optional(),
+    })
+    .refine((value) =>
+      [value.allowSync, value.allowExtensions, value.allowSettings, value.keepRunning].some(
+        (flag) => flag !== undefined,
+      ),
+    ),
 ])
 export type ChromeProposal = z.infer<typeof ChromeProposal>
-/** Record the real disable prerequisite; the confirmed delete stays live and is never replayed. */
-export function chromeProfileIntent(input: ChromeProposal): z.infer<typeof ChromeLedgerProposal> {
+/**
+ * Record each live command's real prerequisite: a confirmed delete needs the profile off; turning
+ * the helper on needs it enabled, and the plugin refuses otherwise. Neither is ever replayed.
+ */
+export function chromeProfileIntent(
+  input: ChromeProposal,
+): z.infer<typeof ChromeLedgerProposal> | null {
   const proposal = ChromeProposal.parse(input)
-  return proposal.action === 'delete-profile'
-    ? { action: 'set-enabled', profile: proposal.profile, enabled: false }
-    : proposal
+  if (
+    proposal.action === 'set-flags' ||
+    proposal.action === 'rename-profile' ||
+    (proposal.action === 'delete-profile' && proposal.deleteConfirmation)
+  )
+    return null
+  if (proposal.action === 'delete-profile')
+    return { action: 'set-enabled', profile: proposal.profile, enabled: false }
+  if (proposal.action === 'helper-on')
+    return { action: 'set-enabled', profile: proposal.profile, enabled: true }
+  return proposal
 }
 /** Fixed reviewed admin adapter. Neither routes, credentials nor arbitrary JSON come from the page. */
 export async function applyChromeProfile(
@@ -47,7 +84,30 @@ export async function applyChromeProfile(
       break
     case 'delete-profile':
       path = '/profiles/' + proposal.profile + '/delete'
-      body = { confirm: proposal.profile }
+      body = {
+        confirm: proposal.profile,
+        ...(proposal.deleteConfirmation ? { deleteConfirmation: proposal.deleteConfirmation } : {}),
+      }
+      break
+    case 'set-flags': {
+      path = '/profiles/' + proposal.profile + '/flags'
+      body = {
+        ...(proposal.allowSync !== undefined ? { allowSync: proposal.allowSync } : {}),
+        ...(proposal.allowExtensions !== undefined
+          ? { allowExtensions: proposal.allowExtensions }
+          : {}),
+        ...(proposal.allowSettings !== undefined ? { allowSettings: proposal.allowSettings } : {}),
+        ...(proposal.keepRunning !== undefined ? { keepRunning: proposal.keepRunning } : {}),
+      }
+      break
+    }
+    case 'rename-profile':
+      path = '/profiles/' + proposal.profile + '/rename'
+      body = { newName: proposal.newName }
+      break
+    case 'helper-on':
+      path = '/profiles/' + proposal.profile + '/helper'
+      body = {}
       break
   }
   const abort = new AbortController()
